@@ -1,0 +1,11 @@
+.env
+.venv/
+.venv-clean/
+__pycache__/
+*.pyc
+outputs/
+.DS_Store
+.nominatim_cache.json
+*.pem
+dbx-debug.log
+map.html
