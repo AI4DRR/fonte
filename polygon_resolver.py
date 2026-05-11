@@ -17,12 +17,20 @@ Design notes
 
 * For the prototype we use the public Nominatim (OpenStreetMap) endpoint as
   the geocoder. Nominatim returns a polygon when one exists in OSM, otherwise
-  a point + bounding box. By default the resolver only accepts true OSM
-  polygons — bbox / point-buffer rectangles are rejected per ladder step
-  (so the ladder keeps descending) to avoid emitting axis-aligned generic
-  shapes for tiny named places that happen to be stored as OSM nodes. Pass
-  ``allow_non_polygon=True`` to NominatimResolver if you want those shapes
-  back as a last resort.
+  a point + bounding box. By default the resolver accepts true OSM polygons,
+  plus the bbox of hits whose ``addresstype`` is a recognised admin or
+  populated-place class (country/state/city/town/village/...) — for those
+  the bbox is a population-driven envelope and a usable footprint stand-in
+  when no relation polygon exists (e.g., Canberra, Cape Town, Quito are
+  OSM nodes). Bbox hits for POI nodes and the ±0.01° point-buffer fallback
+  are still rejected per ladder step. Pass ``allow_non_polygon=True`` to
+  NominatimResolver to accept every non-polygon shape as a last resort.
+
+* ``country_hint`` is a soft preference, not a hard filter: if the ladder
+  fails entirely with the hint applied, the resolver retries it once
+  without the hint. This guards against upstream extractors that emit a
+  wrong document-level country, which would otherwise constrain Nominatim
+  to a country where the place doesn't exist.
 
 * Nominatim's public endpoint requires a descriptive User-Agent and is rate
   limited to roughly 1 request per second. The `_throttle` helper enforces
@@ -332,16 +340,18 @@ class NominatimResolver:
         Parameters
         ----------
         allow_non_polygon
-            When False (default), only OSM hits whose geojson is a true
-            (Multi)Polygon are accepted. Bounding-box and centroid-buffer
-            fallbacks are rejected per ladder step, so the ladder keeps
-            descending instead of returning an axis-aligned rectangle.
-            This avoids "generic square polygon" outputs for tiny named
-            places (sub-villages, hamlets stored as OSM nodes) — they
-            either resolve to their parent admin polygon or stay
-            unresolved. Set True only if you specifically need bbox/point
-            geometries (e.g., for visualization placeholders); the
-            geometry_source field tells you which kind you got.
+            When False (default), OSM polygons are preferred and the
+            ±0.01° point-buffer fallback is rejected per ladder step. The
+            bbox fallback is accepted only for hits whose ``addresstype``
+            is a recognised admin or populated-place class (country, state,
+            city, town, village, ...), where Nominatim's boundingbox is a
+            population-driven envelope and serves as a reasonable footprint
+            stand-in for cities that have no OSM relation polygon (e.g.,
+            Canberra, Cape Town, Quito). Bbox hits for POI nodes are still
+            rejected so the ladder keeps descending. Set True to accept
+            every non-polygon shape (including point_buffer rectangles for
+            arbitrary nodes); the geometry_source field tells you which
+            kind you got.
         """
         if not user_agent or "example" in user_agent.lower():
             raise ValueError(
@@ -369,7 +379,16 @@ class NominatimResolver:
     def resolve(
         self, text: str, country_hint: Optional[str] = None
     ) -> ResolutionResult:
-        """Resolve `text` to a geometry, walking the fallback ladder."""
+        """Resolve `text` to a geometry, walking the fallback ladder.
+
+        ``country_hint`` is treated as a soft preference, not a hard filter:
+        if the whole ladder fails with the hint applied, we retry it once
+        without the hint. This protects us from upstream extractors that
+        emit a wrong document-level country (we've seen "Tegucigalpa" tagged
+        as Albania, "Bucharest" as Algeria, etc.) — in that case the hint
+        would otherwise constrain Nominatim to a country where the place
+        doesn't exist, and every ladder step misses.
+        """
         if not text or not text.strip():
             return ResolutionResult(
                 query="", original=text, geometry=None, admin_level=None,
@@ -377,6 +396,17 @@ class NominatimResolver:
                 error="empty input",
             )
 
+        result = self._walk_ladder(text, country_hint)
+        if result.resolved or country_hint is None:
+            return result
+        # Recovery pass: the hint may be wrong (hallucinated upstream).
+        # Retry without it so well-known places like "Bucharest" can hit.
+        retry = self._walk_ladder(text, None)
+        return retry if retry.resolved else result
+
+    def _walk_ladder(
+        self, text: str, country_hint: Optional[str]
+    ) -> ResolutionResult:
         last_err: Optional[str] = None
         ladder = fallback_ladder(text)
 
@@ -396,7 +426,7 @@ class NominatimResolver:
             if geom_pair is None:
                 continue
             geom, source = geom_pair
-            if source != "polygon" and not self.allow_non_polygon:
+            if source != "polygon" and not self._accept_non_polygon(hit, source):
                 # Reject bbox / point_buffer rectangles — these are
                 # axis-aligned generic shapes, not real footprints. Walk
                 # to the next ladder step instead.
@@ -423,6 +453,31 @@ class NominatimResolver:
             osm_type=None, display_name=None, importance=None,
             error=last_err or "no match",
         )
+
+    def _accept_non_polygon(self, hit: dict, source: str) -> bool:
+        """Decide whether to accept a non-polygon hit.
+
+        Many famous cities (Canberra, Cape Town, Quito, Alexandria) are
+        stored in OSM as nodes — there's no relation polygon, so the
+        polygon-only filter rejects them and we drop the record. For those
+        cases Nominatim's ``boundingbox`` is a population-driven envelope
+        of the populated area, which is a reasonable footprint stand-in.
+
+        We accept bbox (NOT point_buffer) when the hit's ``addresstype`` is
+        a recognised admin/populated-place class. POI nodes (where bbox is
+        meaningless) still get rejected, and the ±0.01° point_buffer is
+        only emitted when the caller explicitly opted in via
+        ``allow_non_polygon=True``.
+        """
+        if self.allow_non_polygon:
+            return True
+        if source != "bbox":
+            return False
+        for key in ("addresstype", "type", "category"):
+            v = hit.get(key)
+            if isinstance(v, str) and v in self._ADMIN_LEVEL_MAP:
+                return True
+        return False
 
     def flush_cache(self) -> None:
         if not self.cache_path:

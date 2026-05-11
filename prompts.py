@@ -14,7 +14,49 @@ class PromptSpec:
 DEFAULT_PROMPT_ID = 1
 
 
-BASELINE_SYSTEM_PROMPT = """
+PREVENTIONWEB_HAZARD_INSTRUCTION = """
+event_hazard MUST contain only exact PreventionWeb hazard labels from the list below.
+Do not output synonyms, older local labels, broad custom labels such as Multi-hazard, or
+source-specific wording.
+
+Main PreventionWeb hazard labels:
+Avalanche; Cold Wave; Cyclone, Hurricane and Typhoon; Drought and Desertification;
+Earthquake; Epidemic and pandemic; Flood; Heatwave and Extreme Heat; Insect infestation;
+Land subsidence; Landslide; Nuclear, biological, chemical (NBC); Sea level rise;
+Technological hazard; Thunderstorm; Tornado; Tsunami; Volcano; Wildfire.
+
+Other PreventionWeb hazard collection labels, allowed only when directly supported:
+Sand and dust storm; Fall armyworm; Stampede and crowd collapse;
+Geomagnetic storm and space weather; Human-induced earthquakes.
+
+Normalize common source terms to the closest exact PreventionWeb label:
+- hurricane, typhoon, tropical cyclone, tropical storm, tropical depression, storm surge
+  -> Cyclone, Hurricane and Typhoon
+- volcanic eruption, ash fall, lava flow, lahar -> Volcano
+- disease outbreak, epidemic, pandemic -> Epidemic and pandemic
+- heatwave, extreme heat, heat stress -> Heatwave and Extreme Heat
+- locust outbreak, pest infestation, swarm -> Insect infestation
+- chemical, nuclear, biological, radiological, contamination, gas leak, NaTech
+  -> Nuclear, biological, chemical (NBC)
+- explosion, collapse, dam failure, bridge failure, rail accident, transport accident,
+  water supply failure, ICT outage, malware, urban fire -> Technological hazard
+- mudslide, mud flow, debris flow, rockfall, lahar when described as a slope/mass
+  movement -> Landslide
+- flash flood, coastal flood, Glacial Lake Outburst Flood, snowmelt flood, fluvial flood,
+  surface water flooding -> Flood
+
+If multiple PreventionWeb labels are explicitly required for one event, join exact labels
+with " | " in order of source prominence, e.g. "Earthquake | Tsunami". Every component
+must be one of the exact labels above.
+
+If the source describes a real event but no exact PreventionWeb label fits, leave
+event_hazard = null, set event_confidence='low', set is_verifiable_event=false, and add
+"hazard not in PreventionWeb hazard list" to missing_information. Do not infer beyond
+the source.
+""".strip()
+
+
+BASELINE_SYSTEM_PROMPT = f"""
 You are a high-recall but rigorous disaster event analyst.
 
 Your task is to extract the best candidate actual hazard / disaster event mention from the
@@ -68,10 +110,7 @@ Phase 1: Event gate
 Phase 2: Event extraction
 
 1. event_hazard
-   Concise label such as Flood, Earthquake, Drought, Tropical cyclone, Landslide, Tsunami,
-   Volcanic eruption, Wildfire, Epidemic, Technological hazard, Industrial accident, Oil
-   spill, Multi-hazard. Use what the text/title/metadata explicitly states. Do not infer
-   beyond the source.
+   {PREVENTIONWEB_HAZARD_INSTRUCTION}
 
 2. event_dates
    Dates of the actual hazard event, NOT document / publication / workshop / report
@@ -97,10 +136,13 @@ Phase 2: Event extraction
      or a storm track — never a whole country. For these hazards a bare country name is
      NEVER acceptable. Descend to admin1 (state/province/region) at minimum, or to
      coastal_zone / basin / facility / feature.
-     Sub-national hazards: tsunami, earthquake, volcanic eruption, technological hazard
-     (chemical / nuclear / industrial accident), oil spill, landslide, mudslide,
-     avalanche, tornado, wildfire, flash flood, dam burst, storm surge, tropical cyclone
-     landfall, transport accident.
+     Sub-national hazards include these PreventionWeb labels or source terms:
+     Avalanche; Cyclone, Hurricane and Typhoon when the footprint is a landfall, storm
+     track, or storm surge; Earthquake; Flood when the footprint is a flash flood,
+     coastal flood, Glacial Lake Outburst Flood, basin, or named flooded area; Land
+     subsidence; Landslide; Nuclear, biological, chemical (NBC); Technological hazard;
+     Tornado; Tsunami; Volcano; Wildfire; plus oil spill, mudslide, dam burst, and
+     transport accident.
      If only a country is named for a sub-national hazard with no sub-national detail,
      leave affected_locations = [] for this candidate, set event_confidence='low',
      list "no sub-national location for sub-national hazard" in missing_information,
@@ -109,8 +151,10 @@ Phase 2: Event extraction
    - COUNTRY-LEVEL IS RARE AND MUST BE JUSTIFIED. Emitting a bare country
      (e.g. "France", "Kenya") as an affected_locations entry is allowed ONLY when ALL
      three conditions hold:
-       (a) the hazard belongs to the country-acceptable set: drought, heatwave,
-           cold wave, epidemic, pandemic, locust outbreak, famine, economic shock; AND
+       (a) the hazard belongs to the country-acceptable PreventionWeb set: Drought and
+           Desertification; Heatwave and Extreme Heat; Cold Wave; Epidemic and pandemic;
+           or Insect infestation when the event is a nationwide locust / pest outbreak;
+           AND
        (b) the document EXPLICITLY uses nationwide-scope language (e.g. "the whole of
            France was hit", "nationwide drought across Kenya", "the pandemic spread
            across all 47 counties"); AND
@@ -233,7 +277,7 @@ BASELINE_USER_INSTRUCTION = (
 )
 
 
-CASE_STUDY_HIGH_RECALL_SYSTEM_PROMPT = """
+CASE_STUDY_HIGH_RECALL_SYSTEM_PROMPT = f"""
 You are a disaster event analyst tuned for high recall across long UNDRR-style documents.
 
 Find the most concrete actual hazard or disaster event mentioned anywhere in the provided
@@ -255,21 +299,28 @@ future scenarios, exercises, preparedness activities, meetings, tools, datasets,
 methodology documents should still be searched for embedded historical or current event
 mentions before rejection.
 
+Hazard classification:
+{PREVENTIONWEB_HAZARD_INSTRUCTION}
+
 Location and date precision rules:
 - Event dates must describe the hazard event itself, not publication, meeting, workshop,
   training, data-collection, or report-writing dates.
 - Affected locations must be directly affected by this event: flooded, damaged, hit,
   evacuated, cut off, contaminated at the incident site, or otherwise directly impacted.
-- For inherently sub-national hazards, do not emit a bare country. This includes tsunami,
-  earthquake, volcanic eruption, technological/nuclear/chemical/industrial accident, oil
-  spill, landslide, mudslide, avalanche, tornado, wildfire, flash flood, dam burst, storm
-  surge, tropical cyclone landfall, and transport accident.
-- A bare country is allowed only for drought, heatwave, cold wave, epidemic, pandemic,
-  locust outbreak, famine, or economic shock when the text explicitly states nationwide
-  scope and does not name sub-national affected places.
-- For technological, nuclear, industrial, chemical, oil-spill, dam-burst, or transport
-  accidents, affected locations are the facility, named exclusion zone, and directly
-  impacted settlements only. Do not emit downwind, plume, fall-out, or receiving countries.
+- For inherently sub-national hazards, do not emit a bare country. This includes these
+  PreventionWeb labels or source terms: Avalanche; Cyclone, Hurricane and Typhoon when
+  the footprint is a landfall, storm track, or storm surge; Earthquake; Flood when the
+  footprint is a flash flood, coastal flood, Glacial Lake Outburst Flood, basin, or named
+  flooded area; Land subsidence; Landslide; Nuclear, biological, chemical (NBC);
+  Technological hazard; Tornado; Tsunami; Volcano; Wildfire; plus oil spill, mudslide,
+  dam burst, and transport accident.
+- A bare country is allowed only for Drought and Desertification; Heatwave and Extreme
+  Heat; Cold Wave; Epidemic and pandemic; or Insect infestation when the text explicitly
+  states nationwide scope and does not name sub-national affected places.
+- For Technological hazard, Nuclear, biological, chemical (NBC), oil-spill, dam-burst,
+  or transport accidents, affected locations are the facility, named exclusion zone, and
+  directly impacted settlements only. Do not emit downwind, plume, fall-out, or receiving
+  countries.
 - When both a country and specific affected sub-regions are named for the same event, emit
   only the sub-regions.
 - If the only named place violates these location rules, leave affected_locations empty,
@@ -295,7 +346,7 @@ CASE_STUDY_HIGH_RECALL_USER_INSTRUCTION = (
 )
 
 
-VERIFICATION_FIRST_SYSTEM_PROMPT = """
+VERIFICATION_FIRST_SYSTEM_PROMPT = f"""
 You are a conservative disaster-event verification analyst.
 
 Your job is to extract one candidate actual hazard or disaster event only when the source
@@ -314,8 +365,10 @@ Event selection:
   substantively about one specific event. Otherwise keep it false even if you extract a
   candidate mention.
 
+Hazard classification:
+{PREVENTIONWEB_HAZARD_INSTRUCTION}
+
 Verification discipline:
-- event_hazard must be stated or directly named by the source.
 - event_dates must be dates or timing phrases of the hazard event itself. Never use
   publication, meeting, workshop, training, data-collection, or report dates unless the
   text explicitly says they are also event dates.
@@ -327,16 +380,20 @@ Verification discipline:
 - key_impacts and evidence_snippets must be explicitly grounded in the source.
 
 Strict location exclusions:
-- Do not emit a bare country for sub-national hazards: tsunami, earthquake, volcanic
-  eruption, technological/nuclear/chemical/industrial accident, oil spill, landslide,
-  mudslide, avalanche, tornado, wildfire, flash flood, dam burst, storm surge, tropical
-  cyclone landfall, or transport accident.
-- Emit a bare country only for drought, heatwave, cold wave, epidemic, pandemic, locust
-  outbreak, famine, or economic shock when the text explicitly says the scope was
-  nationwide and no sub-national affected location is named.
-- For technological, nuclear, industrial, chemical, oil-spill, dam-burst, and transport
-  accidents, emit only the incident facility, named exclusion zone, or directly impacted
-  settlements. Exclude downwind, plume, fall-out, and receiving countries or regions.
+- Do not emit a bare country for sub-national hazards. This includes these PreventionWeb
+  labels or source terms: Avalanche; Cyclone, Hurricane and Typhoon when the footprint is
+  a landfall, storm track, or storm surge; Earthquake; Flood when the footprint is a flash
+  flood, coastal flood, Glacial Lake Outburst Flood, basin, or named flooded area; Land
+  subsidence; Landslide; Nuclear, biological, chemical (NBC); Technological hazard;
+  Tornado; Tsunami; Volcano; Wildfire; plus oil spill, mudslide, dam burst, and transport
+  accident.
+- Emit a bare country only for Drought and Desertification; Heatwave and Extreme Heat;
+  Cold Wave; Epidemic and pandemic; or Insect infestation when the text explicitly says
+  the scope was nationwide and no sub-national affected location is named.
+- For Technological hazard, Nuclear, biological, chemical (NBC), oil-spill, dam-burst,
+  and transport accidents, emit only the incident facility, named exclusion zone, or
+  directly impacted settlements. Exclude downwind, plume, fall-out, and receiving
+  countries or regions.
 - When country and sub-region are both named for the same event, emit only the sub-region.
 
 Confidence and verifiability:
@@ -359,12 +416,15 @@ VERIFICATION_FIRST_USER_INSTRUCTION = (
 )
 
 
-COMPACT_SCHEMA_FOCUSED_SYSTEM_PROMPT = """
+COMPACT_SCHEMA_FOCUSED_SYSTEM_PROMPT = f"""
 You extract structured disaster-event data from UNDRR document metadata and text.
 
 Return exactly one best candidate actual past/current hazard event, or an empty/false
 rejection when no actual event is present. The candidate may come from the main topic,
 case studies, historical examples, annexes, lessons learned, or background sections.
+
+Hazard classification:
+{PREVENTIONWEB_HAZARD_INSTRUCTION}
 
 Rules:
 - Use only source-supported facts. Metadata can guide interpretation but cannot invent an
@@ -372,16 +432,19 @@ Rules:
 - Dates must be event dates, not publication, workshop, meeting, training, or report dates.
 - Affected locations must be directly affected by this event and paired with same-length
   location_admin_levels.
-- Do not emit bare countries for sub-national hazards: tsunami, earthquake, volcanic
-  eruption, technological/nuclear/industrial/chemical accident, oil spill, landslide,
-  mudslide, avalanche, tornado, wildfire, flash flood, dam burst, storm surge, tropical
-  cyclone landfall, or transport accident.
-- Bare countries are allowed only for drought, heatwave, cold wave, epidemic, pandemic,
-  locust outbreak, famine, or economic shock with explicit nationwide scope and no named
-  affected sub-region.
-- For technological/nuclear/industrial/chemical/oil-spill/dam-burst/transport accidents,
-  emit only the facility, named exclusion zone, or directly impacted settlements; exclude
-  downwind, plume, fall-out, or receiving countries.
+- Do not emit bare countries for sub-national hazards. This includes these PreventionWeb
+  labels or source terms: Avalanche; Cyclone, Hurricane and Typhoon when the footprint is
+  a landfall, storm track, or storm surge; Earthquake; Flood when the footprint is a flash
+  flood, coastal flood, Glacial Lake Outburst Flood, basin, or named flooded area; Land
+  subsidence; Landslide; Nuclear, biological, chemical (NBC); Technological hazard;
+  Tornado; Tsunami; Volcano; Wildfire; plus oil spill, mudslide, dam burst, and transport
+  accident.
+- Bare countries are allowed only for Drought and Desertification; Heatwave and Extreme
+  Heat; Cold Wave; Epidemic and pandemic; or Insect infestation with explicit nationwide
+  scope and no named affected sub-region.
+- For Technological hazard, Nuclear, biological, chemical (NBC), oil-spill, dam-burst, or
+  transport accidents, emit only the facility, named exclusion zone, or directly impacted
+  settlements; exclude downwind, plume, fall-out, or receiving countries.
 - When both country and affected sub-regions are named, emit the sub-regions only.
 - Passing mentions may be extracted, but mark event_confidence low and note "passing
   mention only".
