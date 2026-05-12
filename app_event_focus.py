@@ -4,6 +4,9 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -41,6 +44,28 @@ LOCATION_ADMIN_LEVELS = (
 
 REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 REASONING_EFFORT_ARG_DEFAULT = object()
+
+OUTPUT_HEADERS = [
+    "asset_key",
+    "title",
+    "publication_year",
+    "language",
+    "countries",
+    "themes",
+    "hazards",
+    "organizations",
+    "content_url",
+    "is_single_actual_event",
+    "is_verifiable_event",
+    "event_hazard",
+    "event_dates",
+    "affected_locations",
+    "location_admin_levels",
+    "key_impacts",
+    "event_confidence",
+    "evidence_snippets",
+    "missing_information",
+]
 
 
 class EventExtraction(BaseModel):
@@ -234,7 +259,7 @@ def smoke_test_databricks(limit: int) -> None:
             FROM {asset_table}
             WHERE text IS NOT NULL
               AND LENGTH(TRIM(text)) > 0
-            ORDER BY last_processed_at DESC
+            ORDER BY last_processed_at DESC, asset_key ASC
             LIMIT {int(limit)}
         """,
     }
@@ -325,10 +350,11 @@ def fetch_documents(limit: int) -> List[DocumentRow]:
         ON a.asset_key = m.asset_key
     WHERE a.text IS NOT NULL
       AND LENGTH(TRIM(a.text)) > 0
-    ORDER BY a.last_processed_at DESC
+    ORDER BY a.last_processed_at DESC, a.asset_key ASC
     LIMIT {int(limit)}
     """
 
+    started_at = time.perf_counter()
     documents: List[DocumentRow] = []
     with connect_databricks() as connection:
         with connection.cursor() as cursor:
@@ -341,7 +367,8 @@ def fetch_documents(limit: int) -> List[DocumentRow]:
         row_dict = dict(zip(columns, row))
         documents.append(DocumentRow(**row_dict))
 
-    logging.info("Fetched %s documents from Databricks", len(documents))
+    elapsed = time.perf_counter() - started_at
+    logging.info("Fetched %s documents from Databricks in %.1fs", len(documents), elapsed)
     return documents
 
 
@@ -406,31 +433,94 @@ def save_jsonl(rows: List[dict], path: Path) -> None:
 
 def save_csv(rows: List[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    headers = [
-        "asset_key",
-        "title",
-        "publication_year",
-        "language",
-        "countries",
-        "themes",
-        "hazards",
-        "organizations",
-        "content_url",
-        "is_single_actual_event",
-        "is_verifiable_event",
-        "event_hazard",
-        "event_dates",
-        "affected_locations",
-        "location_admin_levels",
-        "key_impacts",
-        "event_confidence",
-        "evidence_snippets",
-        "missing_information",
-    ]
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_HEADERS)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def extraction_to_output_row(doc: DocumentRow, extraction: EventExtraction) -> dict:
+    return {
+        "asset_key": doc.asset_key,
+        "title": doc.title,
+        "publication_year": doc.publication_year,
+        "language": doc.language,
+        "countries": doc.countries,
+        "themes": doc.themes,
+        "hazards": doc.hazards,
+        "organizations": doc.organizations,
+        "content_url": doc.content_url,
+        "is_single_actual_event": extraction.is_single_actual_event,
+        "is_verifiable_event": extraction.is_verifiable_event,
+        "event_hazard": extraction.event_hazard,
+        "event_dates": " | ".join(extraction.event_dates),
+        "affected_locations": " | ".join(extraction.affected_locations),
+        "location_admin_levels": " | ".join(extraction.location_admin_levels),
+        "key_impacts": " | ".join(extraction.key_impacts),
+        "event_confidence": extraction.event_confidence,
+        "evidence_snippets": " | ".join(extraction.evidence_snippets),
+        "missing_information": " | ".join(extraction.missing_information),
+    }
+
+
+def error_output_row(doc: DocumentRow, exc: Exception) -> dict:
+    return {
+        "asset_key": doc.asset_key,
+        "title": doc.title,
+        "publication_year": doc.publication_year,
+        "language": doc.language,
+        "countries": doc.countries,
+        "themes": doc.themes,
+        "hazards": doc.hazards,
+        "organizations": doc.organizations,
+        "content_url": doc.content_url,
+        "is_single_actual_event": None,
+        "is_verifiable_event": None,
+        "event_hazard": None,
+        "event_dates": "",
+        "affected_locations": "",
+        "location_admin_levels": "",
+        "key_impacts": f"ERROR: {exc}",
+        "event_confidence": None,
+        "evidence_snippets": "",
+        "missing_information": "",
+    }
+
+
+def is_error_row(row: dict) -> bool:
+    return str(row.get("key_impacts") or "").startswith("ERROR:")
+
+
+def load_completed_rows(output_dir: Path) -> dict[str, dict]:
+    progress_path = output_dir / "event_extractions_progress.jsonl"
+    final_path = output_dir / "event_extractions.jsonl"
+    source_path = progress_path if progress_path.exists() else final_path
+    if not source_path.exists():
+        return {}
+
+    rows: dict[str, dict] = {}
+    with source_path.open(encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logging.warning("Skipping malformed resume row %s:%s: %s", source_path, line_no, exc)
+                continue
+            asset_key = row.get("asset_key")
+            if asset_key:
+                rows[asset_key] = row
+    logging.info("Loaded %s completed rows from %s", len(rows), source_path)
+    return rows
+
+
+def append_progress_row(row: dict, path: Path, lock: threading.Lock) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def process_documents(
@@ -440,89 +530,131 @@ def process_documents(
     model: str,
     reasoning_effort: Optional[str],
     prompt: PromptSpec,
-    client: AzureOpenAI,
+    client: Optional[AzureOpenAI],
+    workers: int = 1,
+    resume: bool = False,
 ) -> None:
-    output_rows = []
+    started_at = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = output_dir / "event_extractions_progress.jsonl"
+    progress_lock = threading.Lock()
+    thread_local = threading.local()
+
+    completed_by_asset = load_completed_rows(output_dir) if resume else {}
+    if not resume:
+        progress_path.write_text("", encoding="utf-8")
 
     logging.info(
-        "Running prompt %02d (%s) on %s documents",
+        "Running prompt %02d (%s) on %s documents with workers=%s resume=%s",
         prompt.id,
         prompt.name,
         len(documents),
+        workers,
+        resume,
     )
 
-    for idx, doc in enumerate(documents, start=1):
-        logging.info(
-            "Processing document %s/%s | asset_key=%s | title=%s",
-            idx,
-            len(documents),
-            doc.asset_key,
-            doc.title,
-        )
+    pending_documents = [
+        doc for doc in documents
+        if doc.asset_key not in completed_by_asset
+    ]
+    skipped_count = len(documents) - len(pending_documents)
+    if skipped_count:
+        logging.info("Skipping %s already completed documents for prompt %02d", skipped_count, prompt.id)
+
+    def get_thread_client() -> AzureOpenAI:
+        if workers == 1 and client is not None:
+            return client
+        local_client = getattr(thread_local, "client", None)
+        if local_client is None:
+            local_client = get_azure_openai_client()
+            thread_local.client = local_client
+        return local_client
+
+    def process_one(doc: DocumentRow) -> tuple[dict, float, bool]:
+        doc_started_at = time.perf_counter()
         try:
             extraction = extract_document_with_openai(
-                client=client,
+                client=get_thread_client(),
                 doc=doc,
                 max_chars=max_chars,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 prompt=prompt,
             )
+            row = extraction_to_output_row(doc, extraction)
+            failed = False
         except Exception as exc:
             logging.exception("OpenAI extraction failed for asset_key=%s: %s", doc.asset_key, exc)
-            output_rows.append(
-                {
-                    "asset_key": doc.asset_key,
-                    "title": doc.title,
-                    "publication_year": doc.publication_year,
-                    "language": doc.language,
-                    "countries": doc.countries,
-                    "themes": doc.themes,
-                    "hazards": doc.hazards,
-                    "organizations": doc.organizations,
-                    "content_url": doc.content_url,
-                    "is_single_actual_event": None,
-                    "is_verifiable_event": None,
-                    "event_hazard": None,
-                    "event_dates": "",
-                    "affected_locations": "",
-                    "location_admin_levels": "",
-                    "key_impacts": f"ERROR: {exc}",
-                    "event_confidence": None,
-                    "evidence_snippets": "",
-                    "missing_information": "",
-                }
-            )
-            continue
+            row = error_output_row(doc, exc)
+            failed = True
+        return row, time.perf_counter() - doc_started_at, failed
 
-        output_rows.append(
-            {
-                "asset_key": doc.asset_key,
-                "title": doc.title,
-                "publication_year": doc.publication_year,
-                "language": doc.language,
-                "countries": doc.countries,
-                "themes": doc.themes,
-                "hazards": doc.hazards,
-                "organizations": doc.organizations,
-                "content_url": doc.content_url,
-                "is_single_actual_event": extraction.is_single_actual_event,
-                "is_verifiable_event": extraction.is_verifiable_event,
-                "event_hazard": extraction.event_hazard,
-                "event_dates": " | ".join(extraction.event_dates),
-                "affected_locations": " | ".join(extraction.affected_locations),
-                "location_admin_levels": " | ".join(extraction.location_admin_levels),
-                "key_impacts": " | ".join(extraction.key_impacts),
-                "event_confidence": extraction.event_confidence,
-                "evidence_snippets": " | ".join(extraction.evidence_snippets),
-                "missing_information": " | ".join(extraction.missing_information),
-            }
+    new_completed = 0
+    new_failures = 0
+    total_pending = len(pending_documents)
+
+    def record_completed(row: dict, elapsed: float, failed: bool) -> None:
+        nonlocal new_completed, new_failures
+        completed_by_asset[row["asset_key"]] = row
+        append_progress_row(row, progress_path, progress_lock)
+        new_completed += 1
+        if failed:
+            new_failures += 1
+        logging.info(
+            "Completed prompt %02d document %s/%s in %.1fs | asset_key=%s | %s",
+            prompt.id,
+            new_completed,
+            total_pending,
+            elapsed,
+            row["asset_key"],
+            "error" if failed else "ok",
         )
+
+    if total_pending and workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_doc = {
+                executor.submit(process_one, doc): doc
+                for doc in pending_documents
+            }
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                try:
+                    row, elapsed, failed = future.result()
+                except Exception as exc:
+                    logging.exception("Worker failed for asset_key=%s: %s", doc.asset_key, exc)
+                    row = error_output_row(doc, exc)
+                    elapsed = 0.0
+                    failed = True
+                record_completed(row, elapsed, failed)
+    else:
+        for doc in pending_documents:
+            row, elapsed, failed = process_one(doc)
+            record_completed(row, elapsed, failed)
+
+    output_rows = [
+        completed_by_asset[doc.asset_key]
+        for doc in documents
+        if doc.asset_key in completed_by_asset
+    ]
 
     save_jsonl(output_rows, output_dir / "event_extractions.jsonl")
     save_csv(output_rows, output_dir / "event_extractions.csv")
 
-    logging.info("Finished. Wrote:")
+    elapsed = time.perf_counter() - started_at
+    docs_per_min = (new_completed / elapsed * 60.0) if elapsed > 0 else 0.0
+    failure_count = sum(1 for row in output_rows if is_error_row(row))
+    logging.info(
+        "Finished prompt %02d (%s) in %.1fs | processed=%s | skipped=%s | failures=%s | %.2f docs/min",
+        prompt.id,
+        prompt.name,
+        elapsed,
+        new_completed,
+        skipped_count,
+        failure_count,
+        docs_per_min,
+    )
+    logging.info("Wrote:")
+    logging.info("  - %s", output_dir / "event_extractions_progress.jsonl")
     logging.info("  - %s", output_dir / "event_extractions.jsonl")
     logging.info("  - %s", output_dir / "event_extractions.csv")
 
@@ -612,6 +744,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of local OpenAI extraction workers. Use 1 for serial behavior.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing event_extractions_progress.jsonl or event_extractions.jsonl.",
+    )
+    parser.add_argument(
         "--prompt",
         type=int,
         default=DEFAULT_PROMPT_ID,
@@ -641,6 +784,9 @@ def parse_args() -> argparse.Namespace:
         except argparse.ArgumentTypeError as exc:
             parser.error(f"invalid AZURE_OPENAI_REASONING_EFFORT: {exc}")
 
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+
     if not args.all and not args.list_prompts and not args.db_only:
         try:
             get_prompt(args.prompt)
@@ -663,8 +809,8 @@ def main() -> None:
         smoke_test_databricks(limit=args.limit)
         return
 
-    client = get_azure_openai_client()
     documents = fetch_documents(limit=args.limit)
+    client = get_azure_openai_client() if args.workers == 1 else None
 
     if args.all:
         for prompt in PROMPTS:
@@ -683,6 +829,8 @@ def main() -> None:
                 reasoning_effort=args.reasoning_effort,
                 prompt=prompt,
                 client=client,
+                workers=args.workers,
+                resume=args.resume,
             )
         return
 
@@ -695,6 +843,8 @@ def main() -> None:
         reasoning_effort=args.reasoning_effort,
         prompt=prompt,
         client=client,
+        workers=args.workers,
+        resume=args.resume,
     )
 
 
