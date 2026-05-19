@@ -55,6 +55,8 @@ OUTPUT_HEADERS = [
     "hazards",
     "organizations",
     "content_url",
+    "event_index",
+    "event_count",
     "is_single_actual_event",
     "is_verifiable_event",
     "event_hazard",
@@ -74,18 +76,17 @@ class EventExtraction(BaseModel):
             "True only when the document's primary subject is one specific disaster"
             " event, OR a clearly delineated section devotes substantive coverage"
             " (multi-sentence narrative, named places, named impacts, named dates)"
-            " to one specific event. False is allowed for broader, policy-oriented,"
-            " or multi-event documents — the remaining fields should still hold the"
-            " best candidate event mention if one is present."
+            " to this specific event. False is allowed for broader, policy-oriented,"
+            " or multi-event documents."
         )
     )
     is_verifiable_event: bool = Field(
         description=(
-            "Permissive candidate flag for downstream collection. True only when the"
-            " extraction has a hazard, at least one event date, at least one location"
-            " that satisfies the Phase 2 location rules (sub-national hazard scope,"
-            " country justification, technological/Chernobyl rule), and confidence is"
-            " high or medium."
+            "True only when this event has a hazard, at least one event date, at least"
+            " one location that satisfies the Phase 2 location rules (sub-national"
+            " hazard scope, country justification, technological/Chernobyl rule), and"
+            " confidence is high or medium. Returned events should normally all be"
+            " verifiable."
         )
     )
     event_hazard: Optional[str] = Field(
@@ -141,9 +142,9 @@ class EventExtraction(BaseModel):
         description=(
             "Extraction confidence: 'high' (hazard + valid location + date + at least one"
             " impact, all explicit), 'medium' (hazard + valid location explicit; date or"
-            " impacts partial), 'low' (event real but evidence thin, only passing mention,"
-            " or any Phase 2 rule forced fields to be left empty), or null when no"
-            " candidate event exists."
+            " impacts partial), or 'low' (event real but evidence thin, only passing"
+            " mention, or any Phase 2 rule forced fields to be left empty). Multi-event"
+            " extraction should return only high/medium events."
         ),
     )
     evidence_snippets: List[str] = Field(
@@ -186,6 +187,48 @@ class EventExtraction(BaseModel):
         ]
         # Pydantic v2: assign through __dict__ to avoid revalidation loop.
         object.__setattr__(self, "location_admin_levels", levels)
+        return self
+
+
+class DocumentEventExtractions(BaseModel):
+    events: List[EventExtraction] = Field(
+        default_factory=list,
+        description=(
+            "All distinct, source-supported, verifiable disaster/hazard events found in"
+            " the document. Include only high- or medium-confidence events with explicit"
+            " hazard, event timing, and valid directly affected locations. Return an"
+            " empty list when no event satisfies those reliability requirements."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _keep_verified_unique_events(self) -> "DocumentEventExtractions":
+        """Keep the output focused on reliable event records.
+
+        The prompts ask for verifiable high/medium events only. This post-check makes
+        the contract robust if a model still emits a low-confidence or under-specified
+        candidate.
+        """
+        kept: list[EventExtraction] = []
+        seen: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+        for event in self.events:
+            if not event.is_verifiable_event:
+                continue
+            if event.event_confidence not in {"high", "medium"}:
+                continue
+            if not event.event_hazard or not event.event_dates or not event.affected_locations:
+                continue
+            key = (
+                event.event_hazard.strip().lower(),
+                tuple(s.strip().lower() for s in event.event_dates if s.strip()),
+                tuple(s.strip().lower() for s in event.affected_locations if s.strip()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(event)
+
+        object.__setattr__(self, "events", kept)
         return self
 
 
@@ -407,7 +450,7 @@ def extract_document_with_openai(
     model: str,
     reasoning_effort: Optional[str],
     prompt: PromptSpec,
-) -> EventExtraction:
+) -> DocumentEventExtractions:
     payload = build_prompt_payload(doc, max_chars=max_chars)
     completion_kwargs = {
         "model": model,
@@ -415,7 +458,7 @@ def extract_document_with_openai(
             {"role": "system", "content": prompt.system_prompt},
             {"role": "user", "content": build_user_prompt(prompt, payload)},
         ],
-        "response_format": EventExtraction,
+        "response_format": DocumentEventExtractions,
     }
     if reasoning_effort:
         completion_kwargs["reasoning_effort"] = reasoning_effort
@@ -439,7 +482,7 @@ def save_csv(rows: List[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
-def extraction_to_output_row(doc: DocumentRow, extraction: EventExtraction) -> dict:
+def _base_output_row(doc: DocumentRow) -> dict:
     return {
         "asset_key": doc.asset_key,
         "title": doc.title,
@@ -450,30 +493,53 @@ def extraction_to_output_row(doc: DocumentRow, extraction: EventExtraction) -> d
         "hazards": doc.hazards,
         "organizations": doc.organizations,
         "content_url": doc.content_url,
-        "is_single_actual_event": extraction.is_single_actual_event,
-        "is_verifiable_event": extraction.is_verifiable_event,
-        "event_hazard": extraction.event_hazard,
-        "event_dates": " | ".join(extraction.event_dates),
-        "affected_locations": " | ".join(extraction.affected_locations),
-        "location_admin_levels": " | ".join(extraction.location_admin_levels),
-        "key_impacts": " | ".join(extraction.key_impacts),
-        "event_confidence": extraction.event_confidence,
-        "evidence_snippets": " | ".join(extraction.evidence_snippets),
-        "missing_information": " | ".join(extraction.missing_information),
     }
 
 
-def error_output_row(doc: DocumentRow, exc: Exception) -> dict:
-    return {
-        "asset_key": doc.asset_key,
-        "title": doc.title,
-        "publication_year": doc.publication_year,
-        "language": doc.language,
-        "countries": doc.countries,
-        "themes": doc.themes,
-        "hazards": doc.hazards,
-        "organizations": doc.organizations,
-        "content_url": doc.content_url,
+def extraction_to_output_rows(doc: DocumentRow, extraction: DocumentEventExtractions) -> list[dict]:
+    event_count = len(extraction.events)
+    if event_count == 0:
+        return [{
+            **_base_output_row(doc),
+            "event_index": "",
+            "event_count": 0,
+            "is_single_actual_event": False,
+            "is_verifiable_event": False,
+            "event_hazard": None,
+            "event_dates": "",
+            "affected_locations": "",
+            "location_admin_levels": "",
+            "key_impacts": "",
+            "event_confidence": None,
+            "evidence_snippets": "",
+            "missing_information": "no verified reliable event extracted",
+        }]
+
+    rows: list[dict] = []
+    for idx, event in enumerate(extraction.events, start=1):
+        rows.append({
+            **_base_output_row(doc),
+            "event_index": idx,
+            "event_count": event_count,
+            "is_single_actual_event": event.is_single_actual_event,
+            "is_verifiable_event": event.is_verifiable_event,
+            "event_hazard": event.event_hazard,
+            "event_dates": " | ".join(event.event_dates),
+            "affected_locations": " | ".join(event.affected_locations),
+            "location_admin_levels": " | ".join(event.location_admin_levels),
+            "key_impacts": " | ".join(event.key_impacts),
+            "event_confidence": event.event_confidence,
+            "evidence_snippets": " | ".join(event.evidence_snippets),
+            "missing_information": " | ".join(event.missing_information),
+        })
+    return rows
+
+
+def error_output_rows(doc: DocumentRow, exc: Exception) -> list[dict]:
+    return [{
+        **_base_output_row(doc),
+        "event_index": "",
+        "event_count": 0,
         "is_single_actual_event": None,
         "is_verifiable_event": None,
         "event_hazard": None,
@@ -484,21 +550,21 @@ def error_output_row(doc: DocumentRow, exc: Exception) -> dict:
         "event_confidence": None,
         "evidence_snippets": "",
         "missing_information": "",
-    }
+    }]
 
 
 def is_error_row(row: dict) -> bool:
     return str(row.get("key_impacts") or "").startswith("ERROR:")
 
 
-def load_completed_rows(output_dir: Path) -> dict[str, dict]:
+def load_completed_rows(output_dir: Path) -> dict[str, list[dict]]:
     progress_path = output_dir / "event_extractions_progress.jsonl"
     final_path = output_dir / "event_extractions.jsonl"
     source_path = progress_path if progress_path.exists() else final_path
     if not source_path.exists():
         return {}
 
-    rows: dict[str, dict] = {}
+    rows: dict[str, list[dict]] = {}
     with source_path.open(encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
@@ -511,16 +577,17 @@ def load_completed_rows(output_dir: Path) -> dict[str, dict]:
                 continue
             asset_key = row.get("asset_key")
             if asset_key:
-                rows[asset_key] = row
+                rows.setdefault(asset_key, []).append(row)
     logging.info("Loaded %s completed rows from %s", len(rows), source_path)
     return rows
 
 
-def append_progress_row(row: dict, path: Path, lock: threading.Lock) -> None:
+def append_progress_rows(rows: list[dict], path: Path, lock: threading.Lock) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with lock:
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def process_documents(
@@ -570,7 +637,7 @@ def process_documents(
             thread_local.client = local_client
         return local_client
 
-    def process_one(doc: DocumentRow) -> tuple[dict, float, bool]:
+    def process_one(doc: DocumentRow) -> tuple[list[dict], float, bool]:
         doc_started_at = time.perf_counter()
         try:
             extraction = extract_document_with_openai(
@@ -581,22 +648,23 @@ def process_documents(
                 reasoning_effort=reasoning_effort,
                 prompt=prompt,
             )
-            row = extraction_to_output_row(doc, extraction)
+            rows = extraction_to_output_rows(doc, extraction)
             failed = False
         except Exception as exc:
             logging.exception("OpenAI extraction failed for asset_key=%s: %s", doc.asset_key, exc)
-            row = error_output_row(doc, exc)
+            rows = error_output_rows(doc, exc)
             failed = True
-        return row, time.perf_counter() - doc_started_at, failed
+        return rows, time.perf_counter() - doc_started_at, failed
 
     new_completed = 0
     new_failures = 0
     total_pending = len(pending_documents)
 
-    def record_completed(row: dict, elapsed: float, failed: bool) -> None:
+    def record_completed(rows: list[dict], elapsed: float, failed: bool) -> None:
         nonlocal new_completed, new_failures
-        completed_by_asset[row["asset_key"]] = row
-        append_progress_row(row, progress_path, progress_lock)
+        asset_key = rows[0]["asset_key"] if rows else ""
+        completed_by_asset[asset_key] = rows
+        append_progress_rows(rows, progress_path, progress_lock)
         new_completed += 1
         if failed:
             new_failures += 1
@@ -606,7 +674,7 @@ def process_documents(
             new_completed,
             total_pending,
             elapsed,
-            row["asset_key"],
+            asset_key,
             "error" if failed else "ok",
         )
 
@@ -619,23 +687,21 @@ def process_documents(
             for future in as_completed(future_to_doc):
                 doc = future_to_doc[future]
                 try:
-                    row, elapsed, failed = future.result()
+                    rows, elapsed, failed = future.result()
                 except Exception as exc:
                     logging.exception("Worker failed for asset_key=%s: %s", doc.asset_key, exc)
-                    row = error_output_row(doc, exc)
+                    rows = error_output_rows(doc, exc)
                     elapsed = 0.0
                     failed = True
-                record_completed(row, elapsed, failed)
+                record_completed(rows, elapsed, failed)
     else:
         for doc in pending_documents:
-            row, elapsed, failed = process_one(doc)
-            record_completed(row, elapsed, failed)
+            rows, elapsed, failed = process_one(doc)
+            record_completed(rows, elapsed, failed)
 
-    output_rows = [
-        completed_by_asset[doc.asset_key]
-        for doc in documents
-        if doc.asset_key in completed_by_asset
-    ]
+    output_rows = []
+    for doc in documents:
+        output_rows.extend(completed_by_asset.get(doc.asset_key, []))
 
     save_jsonl(output_rows, output_dir / "event_extractions.jsonl")
     save_csv(output_rows, output_dir / "event_extractions.csv")

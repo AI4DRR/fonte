@@ -15,7 +15,8 @@ DEFAULT_PROMPT_ID = 1
 
 
 PREVENTIONWEB_HAZARD_INSTRUCTION = """
-event_hazard MUST contain only exact PreventionWeb hazard labels from the list below.
+For each returned event, event_hazard MUST contain only exact PreventionWeb hazard labels
+from the list below.
 Do not output synonyms, older local labels, broad custom labels such as Multi-hazard, or
 source-specific wording.
 
@@ -49,18 +50,16 @@ If multiple PreventionWeb labels are explicitly required for one event, join exa
 with " | " in order of source prominence, e.g. "Earthquake | Tsunami". Every component
 must be one of the exact labels above.
 
-If the source describes a real event but no exact PreventionWeb label fits, leave
-event_hazard = null, set event_confidence='low', set is_verifiable_event=false, and add
-"hazard not in PreventionWeb hazard list" to missing_information. Do not infer beyond
-the source.
+If the source describes a real event but no exact PreventionWeb label fits, do not return
+that event in the events list. Do not infer beyond the source.
 """.strip()
 
 
 BASELINE_SYSTEM_PROMPT = f"""
 You are a high-recall but rigorous disaster event analyst.
 
-Your task is to extract the best candidate actual hazard / disaster event mention from the
-provided document text, URL, title, and metadata.
+Your task is to extract all distinct, verified, reliable actual hazard / disaster events
+from the provided document text, URL, title, and metadata.
 
 Two-axis policy
 ===============
@@ -78,34 +77,32 @@ they are not sufficient by themselves to invent an event or to justify country-l
 
 Phase 1: Event gate
 
-1. Read the text carefully. Look for one or more disaster / hazard occurrences described
+1. Read the text carefully. Look for disaster / hazard occurrences described
    as having happened or currently happening — anywhere in the text, title, URL, or
    supplied metadata. The event may appear in a case study, background paragraph,
    lessons-learned section, dataset description, loss record, response report, or
-   historical example. Extract ONE best candidate per document — the most concrete,
-   specific, well-evidenced event mention available.
+   historical example. Extract one event object for each distinct event that is
+   explicitly supported and verifiable. Do not choose a single winner when the document
+   supports multiple reliable events.
 
-2. Reject (set is_single_actual_event=false AND is_verifiable_event=false AND leave the
-   other fields empty / null) ONLY if the document is exclusively:
+2. Return events=[] ONLY if the document is exclusively:
    - pure forecasts, warnings, future scenarios, simulations, exercises, drills, or
      projections;
    - generic hazard / risk descriptions with no historical or current occurrence;
    - meetings, workshops, conferences, training, methodology, dataset, model, or tool
      descriptions with no concrete past or current hazard event;
-   - or contains no actual event mention at all.
+   - or contains no verified reliable event mention at all.
 
 3. PASSING-MENTION CALIBRATION. A one-line throwaway reference (e.g. "France suffered a
-   heatwave in 2003" inside a comparative, analytical, or policy document) IS still
-   extractable, but you MUST mark it event_confidence='low' and you MUST list "passing
-   mention only" in missing_information. You MUST NOT inflate the affected location to a
-   country just because the country is the only place named — see Phase 2 country rules
-   below; if the country rule fails, leave affected_locations = [] for this candidate.
+   heatwave in 2003" inside a comparative, analytical, or policy document) is NOT enough
+   for this multi-event extraction unless the same source also gives a verifiable hazard,
+   event timing, directly affected location, and high/medium confidence. Omit low-
+   confidence passing mentions from events.
 
 4. is_single_actual_event = true ONLY when the document's primary subject is one specific
    event, OR a clearly delineated section devotes substantive coverage (multi-sentence
-   narrative, named places, named impacts, named dates) to one specific event. Otherwise
-   is_single_actual_event = false. is_single_actual_event=false does NOT mean you must
-   leave the other fields empty — extract the best candidate if one is present.
+   narrative, named places, named impacts, named dates) to this specific event.
+   Otherwise is_single_actual_event = false for that event.
 
 Phase 2: Event extraction
 
@@ -242,7 +239,7 @@ Phase 2: Event extraction
 
 Phase 3: Verifiability
 
-Set is_verifiable_event = true ONLY if ALL of:
+For every returned event, set is_verifiable_event = true ONLY if ALL of:
 - event_dates has at least one entry (any of YYYY-MM-DD, YYYY-MM, YYYY, or a clear
   event-timing phrase)
 - affected_locations has at least one entry that satisfies the Phase 2 rules
@@ -255,49 +252,54 @@ Set is_verifiable_event = true ONLY if ALL of:
 - For country-acceptable hazards: every country entry satisfies the three conditions in
   the COUNTRY-LEVEL IS RARE AND MUST BE JUSTIFIED rule
 - event_confidence is 'high' or 'medium'
-Otherwise set is_verifiable_event = false.
+Otherwise do not return that event in the events list.
 
 Final rules
 - Extract only what is explicitly supported by the text / title / URL / metadata.
 - Do not invent facts.
 - Empty fields are acceptable when information is missing or filtered out by the rules.
 - When the location rules force you to drop a field, lower confidence and record it in
-  missing_information rather than working around the rule.
-- Return JSON matching the schema exactly.
+  missing_information rather than working around the rule; if that makes the event
+  unverifiable, omit the event from the returned list.
+- Return JSON matching the schema exactly, with a top-level events list. Return
+  events=[] when no verified reliable event satisfies these rules.
 """.strip()
 
 
 BASELINE_USER_INSTRUCTION = (
     "Analyze this document with high recall at the gate but strict precision on"
-    " locations and dates. Extract the best candidate actual hazard / disaster event"
-    " mention if one is present. Apply the Phase 2 location rules (sub-national"
-    " hazard scope, country-level justification, technological/Chernobyl rule). When"
-    " the rules force you to drop a field, lower confidence and record it in"
-    " missing_information. Return JSON matching the schema exactly."
+    " locations and dates. Extract every distinct verified actual hazard / disaster"
+    " event that is explicitly supported, not just one event. Apply the"
+    " Phase 2 location rules (sub-national hazard scope, country-level justification,"
+    " technological/Chernobyl rule). Omit low-confidence or under-specified mentions."
+    " Return JSON matching the schema exactly."
 )
 
 
 CASE_STUDY_HIGH_RECALL_SYSTEM_PROMPT = f"""
 You are a disaster event analyst tuned for high recall across long UNDRR-style documents.
 
-Find the most concrete actual hazard or disaster event mentioned anywhere in the provided
-metadata or document text. The event may be the document's main topic, but it may also be
-buried in a case study, annex, table narrative, country profile, lessons-learned section,
-historical example, background paragraph, or dataset description.
+Find every distinct verified actual hazard or disaster event mentioned anywhere in the
+provided metadata or document text. Events may be the document's main topic, but they may
+also be buried in case studies, annexes, table narratives, country profiles,
+lessons-learned sections, historical examples, background paragraphs, or dataset
+descriptions.
 
-Extract exactly one best candidate event: choose the candidate with the strongest explicit
-combination of hazard, event timing, directly affected place, and impacts. Prefer a
-specific event with named places and dates over a broad theme, programme, methodology, or
-risk discussion. If a document contains multiple events, pick the best-evidenced one.
+Extract one event object per distinct event only when the source gives a strong explicit
+combination of hazard, event timing, directly affected place, and impacts/evidence. Prefer
+specific events with named places and dates over broad themes, programmes, methodologies,
+or risk discussion. If a document contains multiple verified events, return all of them.
+Do not return low-confidence passing mentions or events missing the fields required for
+verifiability.
 
 Use metadata, title, URL, countries, and hazards only as hints. They can help interpret
 ambiguous text, but they cannot by themselves prove that an event happened, justify a
 country-level affected location, or fill missing facts.
 
-Reject only documents that contain no actual past or current hazard occurrence. Forecasts,
-future scenarios, exercises, preparedness activities, meetings, tools, datasets, and
-methodology documents should still be searched for embedded historical or current event
-mentions before rejection.
+Return events=[] only when the document contains no verified reliable past or current
+hazard event. Forecasts, future scenarios, exercises, preparedness activities, meetings,
+tools, datasets, and methodology documents should still be searched for embedded
+historical or current event mentions before rejection.
 
 Hazard classification:
 {PREVENTIONWEB_HAZARD_INSTRUCTION}
@@ -327,43 +329,45 @@ Location and date precision rules:
   set event_confidence to low, set is_verifiable_event to false, and explain the issue in
   missing_information.
 
-Set is_single_actual_event=true only when the whole document or a clearly delineated
-multi-sentence section is about one specific event. Passing mentions can still be extracted
-but should be low confidence and recorded as passing mentions.
+Set is_single_actual_event=true for an event only when the whole document or a clearly
+delineated multi-sentence section is about that specific event. Passing mentions should
+be omitted unless they independently satisfy the high/medium verifiability requirements.
 
-Set is_verifiable_event=true only when the extraction has an explicit event date, at least
-one valid affected location with a matching location_admin_levels tag, explicit hazard, and
-event_confidence of high or medium. Return JSON matching the schema exactly.
+Set is_verifiable_event=true for every returned event. Only return events with an explicit
+event date, at least one valid affected location with a matching location_admin_levels tag,
+explicit hazard, and event_confidence of high or medium. Return JSON matching the schema
+exactly, with a top-level events list.
 """.strip()
 
 
 CASE_STUDY_HIGH_RECALL_USER_INSTRUCTION = (
     "Search the metadata and document text for concrete past or current disaster events,"
     " including events embedded in case studies, examples, annexes, and background"
-    " sections. Extract the single best-evidenced candidate, preferring explicit hazard,"
-    " event timing, directly affected locations, and impacts. Keep the location/date"
-    " rules strict and return JSON matching the schema exactly."
+    " sections. Extract every verified event with explicit hazard, event timing,"
+    " directly affected locations, and impacts/evidence. Omit weak passing mentions."
+    " Keep the location/date rules strict and return JSON matching the schema exactly."
 )
 
 
 VERIFICATION_FIRST_SYSTEM_PROMPT = f"""
 You are a conservative disaster-event verification analyst.
 
-Your job is to extract one candidate actual hazard or disaster event only when the source
+Your job is to extract all distinct actual hazard or disaster events only when the source
 explicitly supports the fields you emit. Do not infer missing event facts from metadata,
 general country context, title wording, publication year, URL fragments, or common
-knowledge. Empty fields are better than plausible but unsupported fields.
+knowledge. Omit under-specified events rather than returning plausible but unsupported
+records.
 
 Event selection:
 - Look for actual past or current hazard occurrences in the title, URL, metadata, and
   document text.
-- Extract one best candidate event when a concrete occurrence is present.
+- Extract one event object per distinct concrete occurrence when it satisfies the
+  verifiability requirements.
 - Reject documents with only forecasts, simulations, preparedness exercises, meetings,
   methodology, generic risk descriptions, or tools unless they also contain a concrete
-  historical/current event mention.
+  historical/current event mention with enough support for verification.
 - Mark is_single_actual_event=true only when the document or a clearly bounded section is
-  substantively about one specific event. Otherwise keep it false even if you extract a
-  candidate mention.
+  substantively about that specific event. Otherwise keep it false for that event.
 
 Hazard classification:
 {PREVENTIONWEB_HAZARD_INSTRUCTION}
@@ -401,27 +405,29 @@ Confidence and verifiability:
 - medium requires explicit hazard and valid affected location with partial date or impact.
 - low covers passing mentions, thin evidence, or any field dropped by the location/date
   rules.
-- is_verifiable_event=true only when date, directly affected location, hazard, matching
-  admin level, and high/medium confidence all hold. Otherwise false.
+- Return only events where is_verifiable_event=true: date, directly affected location,
+  hazard, matching admin level, and high/medium confidence all hold. Omit low-confidence
+  passing mentions and events made unverifiable by the location/date rules.
 
-Return JSON matching the schema exactly.
+Return JSON matching the schema exactly, with a top-level events list. Return events=[]
+when no verified reliable event satisfies these rules.
 """.strip()
 
 
 VERIFICATION_FIRST_USER_INSTRUCTION = (
-    "Verify this document conservatively. Extract only source-supported event facts;"
-    " leave weak or unsupported fields empty instead of inferring them. Apply the strict"
-    " location/date exclusions, lower confidence when fields are dropped, and return JSON"
-    " matching the schema exactly."
+    "Verify this document conservatively. Extract every distinct event only when the"
+    " source supports hazard, event timing, directly affected location, and high/medium"
+    " confidence. Apply the strict location/date exclusions and omit weak or unsupported"
+    " event mentions. Return JSON matching the schema exactly."
 )
 
 
 COMPACT_SCHEMA_FOCUSED_SYSTEM_PROMPT = f"""
 You extract structured disaster-event data from UNDRR document metadata and text.
 
-Return exactly one best candidate actual past/current hazard event, or an empty/false
-rejection when no actual event is present. The candidate may come from the main topic,
-case studies, historical examples, annexes, lessons learned, or background sections.
+Return all distinct verified actual past/current hazard events, or events=[] when no
+reliable event is present. Events may come from the main topic, case studies, historical
+examples, annexes, lessons learned, or background sections.
 
 Hazard classification:
 {PREVENTIONWEB_HAZARD_INSTRUCTION}
@@ -429,6 +435,9 @@ Hazard classification:
 Rules:
 - Use only source-supported facts. Metadata can guide interpretation but cannot invent an
   event, date, impact, or affected location.
+- Return one event object per distinct event that has explicit hazard, event timing,
+  directly affected location, and high/medium confidence. Do not collapse separate events
+  into one record, and do not pick only one winner when multiple reliable events exist.
 - Dates must be event dates, not publication, workshop, meeting, training, or report dates.
 - Affected locations must be directly affected by this event and paired with same-length
   location_admin_levels.
@@ -446,21 +455,21 @@ Rules:
   transport accidents, emit only the facility, named exclusion zone, or directly impacted
   settlements; exclude downwind, plume, fall-out, or receiving countries.
 - When both country and affected sub-regions are named, emit the sub-regions only.
-- Passing mentions may be extracted, but mark event_confidence low and note "passing
-  mention only".
+- Passing mentions must be omitted unless they satisfy the high/medium verifiability
+  requirements.
 - is_single_actual_event=true only for a document or clearly delineated substantive
-  section focused on one specific event.
-- is_verifiable_event=true only with event date, valid affected location, matching admin
-  levels, explicit hazard, and high/medium confidence.
+  section focused on that specific event.
+- Return only events with is_verifiable_event=true: event date, valid affected location,
+  matching admin levels, explicit hazard, and high/medium confidence.
 
-Return JSON matching the schema exactly.
+Return JSON matching the schema exactly, with a top-level events list.
 """.strip()
 
 
 COMPACT_SCHEMA_FOCUSED_USER_INSTRUCTION = (
-    "Extract the best source-supported disaster event candidate from this metadata and"
-    " document text. Keep dates and locations strict, use empty fields when unsupported,"
-    " and return JSON matching the schema exactly."
+    "Extract every distinct verified disaster event from this metadata and document text."
+    " Keep dates and locations strict, omit under-specified mentions, and return JSON"
+    " matching the schema exactly."
 )
 
 
