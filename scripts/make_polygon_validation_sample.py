@@ -32,7 +32,7 @@ This slots next to visualize_event_extractions.py and reuses its
 Usage
 -----
 
-    python make_polygon_validation_sample.py \
+    python scripts/make_polygon_validation_sample.py \
       --extractions outputs/test_400/event_extractions.jsonl \
       --geometries  outputs/test_400/event_geometries.parquet \
       --output-dir  outputs/test_400_polygon_validation
@@ -50,7 +50,7 @@ from typing import Iterable
 import geopandas as gpd
 import pandas as pd
 
-from run_polygon_resolution import explode_extractions, event_uuid
+from groundsource.run_polygon_resolution import explode_extractions, event_uuid
 
 
 LOG = logging.getLogger("polygon_validation")
@@ -188,9 +188,9 @@ PRESENTATION_COLUMNS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--extractions", type=Path, required=True,
-                   help="Source JSONL produced by app_event_focus.py")
+                   help="Source JSONL produced by groundsource-extract")
     p.add_argument("--geometries", type=Path, required=True,
-                   help="Parquet produced by run_polygon_resolution.py")
+                   help="Parquet produced by groundsource-polygons")
     p.add_argument("--output-dir", type=Path, required=True,
                    help="Directory for the review CSV and summary JSON")
     p.add_argument("--high-conf-n", type=int, default=15)
@@ -223,7 +223,7 @@ def main() -> int:
     if "resolution_geometry_source" not in gdf.columns:
         LOG.error(
             "Column 'resolution_geometry_source' is missing from the parquet — "
-            "you're using an older resolver output. Re-run run_polygon_resolution.py "
+            "you're using an older resolver output. Re-run groundsource-polygons "
             "(it'll be cheap; the Nominatim cache is hot) to regenerate the parquet."
         )
         return 1

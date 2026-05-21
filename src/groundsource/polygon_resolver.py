@@ -1,8 +1,8 @@
 """
-polygon_resolver.py
+groundsource.polygon_resolver
 -------------------
 
-Resolve free-text location strings (as produced by app_event_focus.py's
+Resolve free-text location strings (as produced by groundsource-extract's
 `affected_locations` field) into geometries that match Google Groundsource's
 output schema:
 

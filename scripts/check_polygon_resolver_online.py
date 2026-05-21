@@ -1,5 +1,5 @@
 """
-test_polygon_resolver.py
+check_polygon_resolver_online.py
 ------------------------
 
 Lightweight self-test for the polygon-resolver prototype. Hits the public
@@ -11,7 +11,7 @@ outputs/test_400/event_extractions.jsonl, including the messy ones (sub-city
 qualifiers, geological features, multi-comma fragments).
 
 Run:
-    python test_polygon_resolver.py --user-agent "undrr-test/0.1 (you@undrr.org)"
+    python scripts/check_polygon_resolver_online.py --user-agent "undrr-test/0.1 (you@undrr.org)"
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from polygon_resolver import NominatimResolver, fallback_ladder
+from groundsource.polygon_resolver import NominatimResolver, fallback_ladder
 
 # Mix of granularities + difficulty levels. (resolved, tag) — `resolved` is
 # the expected outcome under the v2 ladder (possessive + facility rewrites).

@@ -1,0 +1,3 @@
+# Developer/test install.
+# Add `-c constraints.txt` for the known-good pinned versions.
+-e .[dev]

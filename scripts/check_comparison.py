@@ -95,9 +95,9 @@ def parse_args() -> argparse.Namespace:
 
 def load_prompt_names() -> Dict[int, str]:
     try:
-        from prompts import PROMPTS
+        from groundsource.prompts import PROMPTS
     except Exception as exc:  # pragma: no cover - optional convenience only
-        logging.warning("Could not import prompt names from prompts.py: %s", exc)
+        logging.warning("Could not import prompt names from groundsource.prompts: %s", exc)
         return {}
     return {prompt.id: prompt.name for prompt in PROMPTS}
 

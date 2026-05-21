@@ -1,15 +1,4 @@
-openai>=2.30.0
-databricks-sql-connector[pyarrow]>=4.0.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
-streamlit>=1.36.0
-
-# Polygon-resolution prototype (polygon_resolver.py / run_polygon_resolution.py)
-geopandas>=0.14
-shapely>=2.0
-pyarrow>=14.0
-requests>=2.31
-rapidfuzz>=3.6
-pycountry>=23.12     # name -> ISO alpha-2 for possessive rewrite ("Thailand's …" -> hint TH)
-folium>=0.17         # interactive Leaflet maps for gdf.explore()
-mapclassify>=2.6     # choropleth classification used by gdf.explore()
+# Runtime dependencies are declared in pyproject.toml.
+# This keeps legacy `pip install -r requirements.txt` workflows working.
+# Add `-c constraints.txt` for the known-good pinned versions.
+-e .

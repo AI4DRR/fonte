@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_PATH = REPO_ROOT / "eval" / "gold_review_app.py"
 
 

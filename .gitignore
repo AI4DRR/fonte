@@ -2,6 +2,7 @@
 .venv/
 .venv-clean/
 __pycache__/
+**/__pycache__/
 *.pyc
 outputs/
 .DS_Store
@@ -9,3 +10,6 @@ outputs/
 *.pem
 dbx-debug.log
 map.html
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

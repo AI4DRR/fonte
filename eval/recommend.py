@@ -29,7 +29,7 @@ DEFAULT_SCORES = REPO_ROOT / "eval" / "scores.csv"
 DEFAULT_SCORES_SEG = REPO_ROOT / "eval" / "scores_by_segment.csv"
 DEFAULT_OUT = REPO_ROOT / "eval" / "RECOMMENDATION.md"
 
-# Prompt name lookup (kept in sync with prompts.py PROMPTS tuple). One
+# Prompt name lookup (kept in sync with groundsource.prompts PROMPTS tuple). One
 # line per prompt, matching the id used in run_id like 'prompt01'.
 PROMPT_NAMES = {
     "01": ("baseline_strict_location",

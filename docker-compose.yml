@@ -17,8 +17,8 @@ services:
       # Databricks TLS chain (gitignored, scp'd to the VM separately).
       - ./databricks_chain.pem:/app/databricks_chain.pem:ro
     # Default command is the extraction pipeline. Run polygon resolution
-    # with: `docker compose run --rm extractor python run_polygon_resolution.py ...`
-    command: ["python", "app_event_focus.py", "--limit", "5"]
+    # with: `docker compose run --rm extractor groundsource-polygons ...`
+    command: ["groundsource-extract", "--limit", "5"]
 
   review:
     # Streamlit gold-review UI. Start with `docker compose up review`.
@@ -34,6 +34,6 @@ services:
     command:
       - streamlit
       - run
-      - test_gold_review_app.py
+      - eval/gold_review_app.py
       - --server.address=0.0.0.0
       - --server.port=8501

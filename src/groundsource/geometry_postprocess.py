@@ -1,5 +1,5 @@
 """
-geometry_postprocess.py
+groundsource.geometry_postprocess
 -----------------------
 
 Hazard-aware geometry post-processing for the polygon resolver.
@@ -28,7 +28,7 @@ This module exposes two things:
 Usage
 =====
 
-    from geometry_postprocess import HazardAwarePostprocessor
+    from groundsource.geometry_postprocess import HazardAwarePostprocessor
 
     pp = HazardAwarePostprocessor(coastline_path="data/ne_50m_coastline.zip")
     new_geom, note = pp.process(hazard="Tsunami", geometry=country_polygon)
@@ -364,7 +364,7 @@ def download_coastline(dest: Path) -> Path:
 
 # ---------------------------------------------------------------------------
 # Sub-national hazard set used by the country-overshoot guard in the runner.
-# Mirrors (intentionally) the prompt list in prompts.py.
+# Mirrors (intentionally) the prompt list in groundsource.prompts.
 # Centralised here so any consumer (runner, validation tool, dashboard) can
 # import the canonical set instead of duplicating it.
 # ---------------------------------------------------------------------------

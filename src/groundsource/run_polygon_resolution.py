@@ -1,8 +1,8 @@
 """
-run_polygon_resolution.py
+groundsource.run_polygon_resolution
 -------------------------
 
-Demo runner: read the pipeline's JSONL output (as produced by app_event_focus.py),
+Demo runner: read the pipeline's JSONL output (as produced by groundsource-extract),
 resolve every `affected_locations` value to a geometry, and write a parquet
 matching Google Groundsource's schema:
 
@@ -18,7 +18,7 @@ Usage
     pip install geopandas shapely pyarrow rapidfuzz requests
 
     # then:
-    python run_polygon_resolution.py \
+    groundsource-polygons \
         --input  outputs/test_400/event_extractions.jsonl \
         --output outputs/test_400/event_geometries.parquet \
         --user-agent "undrr-groundsource/0.1 (your-email@undrr.org)"
@@ -46,8 +46,8 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import MultiPolygon, Polygon
 
-from polygon_resolver import NominatimResolver, ResolutionResult
-from geometry_postprocess import (
+from groundsource.polygon_resolver import NominatimResolver, ResolutionResult
+from groundsource.geometry_postprocess import (
     HazardAwarePostprocessor,
     is_sub_national_hazard,
 )
@@ -61,7 +61,7 @@ EQUAL_AREA_EPSG = 6933
 
 
 # ---------------------------------------------------------------------------
-# Input parsing — matches app_event_focus.py JSONL output
+# Input parsing: matches groundsource-extract JSONL output.
 # ---------------------------------------------------------------------------
 
 def _split_pipes(s: Optional[str]) -> list[str]:

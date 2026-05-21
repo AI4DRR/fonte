@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "undrr-groundsource-starter"
+version = "0.1.0"
+description = "UNDRR Groundsource extraction and polygon-resolution prototype."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "certifi>=2024.0",
+    "databricks-sql-connector[pyarrow]>=4.0.0",
+    "folium>=0.17",
+    "geopandas>=0.14",
+    "mapclassify>=2.6",
+    "matplotlib>=3.8",
+    "openai>=2.30.0",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "pycountry>=23.12",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "rapidfuzz>=3.6",
+    "requests>=2.31",
+    "shapely>=2.0",
+    "streamlit>=1.36.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+groundsource-extract = "groundsource.app_event_focus:main"
+groundsource-polygons = "groundsource.run_polygon_resolution:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,7 +1,7 @@
 # Prompt × reasoning-effort selection — runbook
 
 Goal: pick the best prompt + reasoning-effort combination for the
-`app_event_focus.py` extraction step, using the 8 runs already produced
+`groundsource-extract` extraction step, using the 8 runs already produced
 under `outputs/test_400_gpt5_{high,medium}_prompt{01..04}/`.
 
 The strategy is a five-stage funnel. Stages 1–2 are label-free and run
@@ -112,6 +112,3 @@ Then re-run from Stage 1.
 | 3 | `gold_template.py` | `review_sample.csv` | `gold.csv` (template) |
 | 4 | `score_against_gold.py` | `gold.csv`, `unified.parquet` | `scores.csv`, `scores_by_segment.csv` |
 | 5 | `recommend.py` | `scores.csv`, `scores_by_segment.csv` | `RECOMMENDATION.md` |
-
-The plan that drove this lives at
-`~/.claude/plans/i-have-run-the-misty-goblet.md`.

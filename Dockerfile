@@ -15,11 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+# Install the package first so console commands are available in the image.
+COPY pyproject.toml README.md requirements.txt constraints.txt ./
+COPY src ./src
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -r requirements.txt -c constraints.txt
 
-# Copy source. Anything large/regenerable is excluded via .dockerignore.
-COPY . .
+# Copy runnable helpers and small reference data. Large/regenerable artifacts
+# are excluded via .dockerignore and mounted from the host when needed.
+COPY scripts ./scripts
+COPY eval ./eval
+COPY data ./data
 
 # Output and cache directories are mounted as volumes from the host in
 # docker-compose.yml so artifacts survive container restarts.
@@ -29,4 +35,4 @@ EXPOSE 8501
 
 # Default: run the main extraction pipeline. Override at `docker run` /
 # `docker compose run` time to run polygon resolution or the Streamlit app.
-CMD ["python", "app_event_focus.py", "--limit", "5"]
+CMD ["groundsource-extract", "--limit", "5"]
