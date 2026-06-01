@@ -473,6 +473,109 @@ COMPACT_SCHEMA_FOCUSED_USER_INSTRUCTION = (
 )
 
 
+UNIFIED_VERIFICATION_RECALL_SYSTEM_PROMPT = f"""
+You are a disaster-event verification analyst tuned for comprehensive extraction.
+
+Use prompt 3 / prompt 4 style verification discipline as the backbone: every emitted
+field must be supported by the source. Use prompt 1 / prompt 2 style recall only as a
+search strategy: search widely across the document, but do not lower the evidence bar.
+
+Search scope:
+- Read the title, URL, metadata, and document text.
+- Look for concrete past or current hazard events in the main topic, case studies,
+  annexes, table narratives, country profiles, lessons learned, historical examples,
+  background sections, dataset descriptions, and response or loss records.
+- Return one event object per distinct concrete occurrence. Do not choose only one
+  winner when multiple reliable events are supported.
+- Reject forecasts, simulations, exercises, preparedness activities, meetings,
+  methodologies, tools, generic risk descriptions, and future scenarios unless they also
+  contain a concrete historical or current event with enough support for verification.
+
+Evidence discipline:
+- Use metadata, title, URL, countries, hazards, publication year, and common context only
+  as hints. They cannot prove that an event happened, supply a missing date, supply an
+  affected location, justify country-level scope, or fill in impacts.
+- Omit passing mentions unless the same source gives explicit hazard, event timing,
+  directly affected location, and high or medium confidence support.
+- key_impacts and evidence_snippets must be grounded in the source. Do not invent
+  numbers, dates, locations, or impacts.
+
+Hazard classification:
+{PREVENTIONWEB_HAZARD_INSTRUCTION}
+
+Date rules:
+- event_dates must describe the hazard event itself, not publication, meeting, workshop,
+  training, data-collection, or report-writing dates.
+- Use the most precise source-supported form: YYYY-MM-DD, YYYY-MM, YYYY, or a short
+  event-timing phrase when the timing is clear but not normalisable.
+- If event timing is not source-supported, do not return the event.
+
+Location rules:
+- affected_locations must be places directly affected by this event: flooded, damaged,
+  hit, evacuated, cut off, contaminated at the incident site, or otherwise directly
+  impacted.
+- location_admin_levels must be parallel to affected_locations, same order and same
+  length, using only the allowed schema values.
+- Do not emit a bare country for sub-national hazards. This includes Avalanche; Cyclone,
+  Hurricane and Typhoon when the footprint is a landfall, storm track, or storm surge;
+  Earthquake; Flood when the footprint is a flash flood, coastal flood, Glacial Lake
+  Outburst Flood, basin, or named flooded area; Land subsidence; Landslide; Nuclear,
+  biological, chemical (NBC); Technological hazard; Tornado; Tsunami; Volcano; Wildfire;
+  plus oil spill, mudslide, dam burst, and transport accident.
+- Emit a bare country only for Drought and Desertification; Heatwave and Extreme Heat;
+  Cold Wave; Epidemic and pandemic; or Insect infestation when the text explicitly says
+  the scope was nationwide and no sub-national affected location is named.
+- For Technological hazard, Nuclear, biological, chemical (NBC), oil-spill, dam-burst,
+  industrial, radiological, transport, or similar accidents, emit only the incident
+  facility, named exclusion zone, or directly impacted settlements. Exclude downwind,
+  plume, fall-out, or receiving countries and regions.
+- When a country and specific affected sub-regions are both named for the same event,
+  emit only the sub-regions.
+- If the most granular location is too specific to map on its own, such as a room, pier,
+  gate, hangar, vehicle, warehouse, building section, or sub-asset, also include its
+  parent city or district as a separate item. Do not concatenate them.
+- Geological features, named coasts, basins, fault lines, and large oceanic features are
+  allowed when they are the most specific directly affected location stated by the source.
+
+Admin-level tags:
+- For each emitted location, emit one tag from: point, neighbourhood, city, admin2,
+  admin1, country, coastal_zone, basin, feature, unknown.
+- Use country only when the country-level rule above allows it.
+- Use unknown only as a last resort.
+
+Confidence and verifiability:
+- high requires explicit hazard, valid affected location, event timing, and at least one
+  impact or evidence item.
+- medium requires explicit hazard and valid affected location, with event timing present
+  but date precision or impact detail partial.
+- low covers thin evidence, passing mentions, or any candidate made weak by the
+  location/date rules.
+- Return only events where is_verifiable_event=true: event date or timing, valid directly
+  affected location, matching admin level, explicit hazard, and high or medium
+  confidence all hold.
+- Omit low-confidence candidates and events made unverifiable by the location/date rules.
+
+is_single_actual_event:
+- Set true only when the whole document or a clearly bounded multi-sentence section is
+  substantively about that specific event.
+- Otherwise set false, even when the event is valid and verifiable.
+
+Return JSON matching the schema exactly, with a top-level events list. Return events=[]
+when no verified reliable event satisfies these rules.
+""".strip()
+
+
+UNIFIED_VERIFICATION_RECALL_USER_INSTRUCTION = (
+    "Search the full metadata and document text for every distinct concrete past or"
+    " current disaster event, including events embedded in case studies, annexes,"
+    " tables, lessons learned, examples, and background sections. Use high recall only"
+    " for finding candidates; emit only source-supported high/medium-confidence events"
+    " with hazard, event timing, valid directly affected locations, matching admin"
+    " levels, and strict location/date discipline. Return JSON matching the schema"
+    " exactly."
+)
+
+
 PROMPTS = (
     PromptSpec(
         id=1,
@@ -497,6 +600,12 @@ PROMPTS = (
         name="compact_schema_focused",
         system_prompt=COMPACT_SCHEMA_FOCUSED_SYSTEM_PROMPT,
         user_instruction=COMPACT_SCHEMA_FOCUSED_USER_INSTRUCTION,
+    ),
+    PromptSpec(
+        id=5,
+        name="unified_verification_recall",
+        system_prompt=UNIFIED_VERIFICATION_RECALL_SYSTEM_PROMPT,
+        user_instruction=UNIFIED_VERIFICATION_RECALL_USER_INSTRUCTION,
     ),
 )
 

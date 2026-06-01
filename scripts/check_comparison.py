@@ -33,6 +33,8 @@ POPUP_FIELDS = [
     "area_km2",
     "resolution_admin_level",
     "resolution_confidence",
+    "source_prompts",
+    "source_prompt_count",
     "geometry_postprocess",
     "geometry_overshoot",
     "content_url",
