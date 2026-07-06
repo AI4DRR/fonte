@@ -11,7 +11,7 @@ class PromptSpec:
     user_instruction: str
 
 
-DEFAULT_PROMPT_ID = 1
+DEFAULT_PROMPT_ID = 5
 
 
 PREVENTIONWEB_HAZARD_INSTRUCTION = """

@@ -11,6 +11,7 @@ Streamlit session before the first write.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import shutil
 import tempfile
@@ -20,7 +21,17 @@ from typing import Iterable
 
 
 APP_DIR = Path(__file__).resolve().parent
+REPO_ROOT = APP_DIR.parent
 DEFAULT_GOLD_PATH = APP_DIR / "gold.csv"
+
+# Prompt 5 is the production default (DEFAULT_PROMPT_ID = 5). Its full
+# extraction for the corpus lives in the canonical production run below; the
+# path is overridable from the sidebar so a different prompt-5 run can be used.
+DEFAULT_PROMPT5_EXTRACTION_PATH = REPO_ROOT / "outputs" / "event_extractions" / "event_extractions.jsonl"
+
+# Extraction fields rendered for each prompt-5 event, in display order.
+# (event_confidence_logprob / event_confidence_prob are shown when present.)
+PROMPT5_LIST_FIELDS = ("affected_locations", "key_impacts", "evidence_snippets", "missing_information")
 
 REFERENCE_COLUMNS = (
     "asset_key",
@@ -205,6 +216,115 @@ def _source_panel(row: dict[str, str]) -> None:
         components.iframe(url, height=720, scrolling=True)
 
 
+def load_prompt5_index(path: Path) -> dict[str, list[dict]]:
+    """Group a prompt-5 extraction JSONL by asset_key, events ordered by index.
+
+    Returns ``{asset_key: [event_record, ...]}``. Records with a blank
+    event_index (the "no verifiable event" placeholder row) sort last.
+    """
+    index: dict[str, list[dict]] = {}
+    if not path.exists():
+        return index
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = obj.get("asset_key")
+            if key:
+                index.setdefault(key, []).append(obj)
+
+    def _event_order(obj: dict) -> int:
+        try:
+            return int(obj.get("event_index", ""))
+        except (TypeError, ValueError):
+            return 10**9
+
+    for key in index:
+        index[key].sort(key=_event_order)
+    return index
+
+
+def _get_prompt5_index(path: Path) -> dict[str, list[dict]]:
+    """Session-cached loader, invalidated when the file's mtime changes."""
+    import streamlit as st
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cache_key = f"prompt5_index::{path}::{mtime}"
+    if cache_key not in st.session_state:
+        for stale in [k for k in list(st.session_state) if str(k).startswith(f"prompt5_index::{path}::")]:
+            del st.session_state[stale]
+        st.session_state[cache_key] = load_prompt5_index(path)
+    return st.session_state[cache_key]
+
+
+def _fmt_list_field(value: str) -> str:
+    """Render a ' | '-joined extraction field as a markdown bullet list."""
+    parts = [p.strip() for p in str(value or "").split("|") if p.strip()]
+    if not parts:
+        return "_(none)_"
+    return "\n".join(f"- {p}" for p in parts)
+
+
+def _prompt5_panel(row: dict[str, str], path: Path) -> None:
+    import streamlit as st
+
+    st.subheader("Prompt 5 extraction — production output")
+    st.caption(f"Source: {path}")
+
+    index = _get_prompt5_index(path)
+    if not index:
+        st.warning(f"No prompt-5 extraction loaded. Check the source path in the sidebar:\n`{path}`")
+        return
+
+    asset = row.get("asset_key", "").strip()
+    events = index.get(asset, [])
+    real_events = [e for e in events if str(e.get("event_index", "")).strip()]
+
+    if not events:
+        st.warning("This asset_key is not present in the prompt-5 extraction file.")
+        return
+    if not real_events:
+        miss = events[0].get("missing_information") or "no verifiable event extracted"
+        st.info(f"Prompt 5 returned **no verifiable event** for this asset. ({miss})")
+        return
+
+    st.write(f"**{len(real_events)} event(s) extracted by prompt 5**")
+    for e in real_events:
+        idx = e.get("event_index", "?")
+        cnt = e.get("event_count", "?")
+        hazard = e.get("event_hazard") or "(no hazard)"
+        conf = e.get("event_confidence") or "-"
+        prob = e.get("event_confidence_prob")
+        logp = e.get("event_confidence_logprob")
+        conf_label = conf
+        if isinstance(prob, (int, float)):
+            conf_label += f" · p={prob:.2f}"
+        elif isinstance(logp, (int, float)):
+            conf_label += f" · logprob={logp:.2f}"
+
+        with st.container(border=True):
+            st.markdown(f"**Event {idx} of {cnt} — {hazard}**  \nConfidence: {conf_label}")
+            st.caption(
+                f"is_verifiable_event={e.get('is_verifiable_event')} · "
+                f"is_single_actual_event={e.get('is_single_actual_event')}"
+            )
+            st.markdown(f"**Dates:** {e.get('event_dates') or '-'}")
+            st.markdown(f"**Admin levels:** {e.get('location_admin_levels') or '-'}")
+            st.markdown("**Affected locations:**\n" + _fmt_list_field(e.get("affected_locations")))
+            st.markdown("**Key impacts:**\n" + _fmt_list_field(e.get("key_impacts")))
+            with st.expander("Evidence & missing information"):
+                st.markdown("**Evidence snippets:**\n" + _fmt_list_field(e.get("evidence_snippets")))
+                st.markdown("**Missing information:**\n" + _fmt_list_field(e.get("missing_information")))
+
+
 def _label_form(row: dict[str, str], row_index: int) -> dict[str, str] | None:
     import streamlit as st
 
@@ -327,6 +447,14 @@ def _navigation(path: Path, rows: list[dict[str, str]]) -> None:
     if backup_key in st.session_state:
         st.sidebar.caption(f"Backup: {st.session_state[backup_key]}")
 
+    st.sidebar.header("Prompt 5 source")
+    st.sidebar.text_input(
+        "Extraction JSONL",
+        value=st.session_state.get("prompt5_source_path", str(DEFAULT_PROMPT5_EXTRACTION_PATH)),
+        key="prompt5_source_path",
+        help="Prompt-5 (production) extraction shown for each asset. Override to use a different run.",
+    )
+
 
 def main() -> None:
     import streamlit as st
@@ -355,8 +483,11 @@ def main() -> None:
     st.code(row.get("asset_key", ""), language=None)
     _row_badges(row)
 
-    st.subheader("Model Hazard Summary")
-    st.write(row.get("runs_hazard_summary", "") or "-")
+    prompt5_path = Path(st.session_state.get("prompt5_source_path", str(DEFAULT_PROMPT5_EXTRACTION_PATH)))
+    _prompt5_panel(row, prompt5_path)
+
+    with st.expander("All benchmark runs — hazard summary (reference)"):
+        st.write(row.get("runs_hazard_summary", "") or "-")
 
     left, right = st.columns([1.05, 0.95], gap="large")
     with left:

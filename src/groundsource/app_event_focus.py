@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -65,6 +66,8 @@ OUTPUT_HEADERS = [
     "location_admin_levels",
     "key_impacts",
     "event_confidence",
+    "event_confidence_logprob",
+    "event_confidence_prob",
     "evidence_snippets",
     "missing_information",
 ]
@@ -261,6 +264,18 @@ def setup_logging(level: str) -> None:
     )
 
 
+def format_duration(seconds: float) -> str:
+    """Render an elapsed duration as e.g. '1h 02m 03.4s' or '7.8s'."""
+    total = max(seconds, 0.0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours >= 1:
+        return f"{int(hours)}h {int(minutes):02d}m {secs:04.1f}s"
+    if minutes >= 1:
+        return f"{int(minutes)}m {secs:04.1f}s"
+    return f"{secs:.1f}s"
+
+
 def require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -277,12 +292,32 @@ def connect_databricks():
         _tls_trusted_ca_file=ca_file,
     )
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
 def get_azure_openai_client() -> AzureOpenAI:
+    # The SDK automatically retries 429 / 5xx with exponential backoff and
+    # honors the server's Retry-After header. The default (2) is too low for
+    # sustained concurrent runs, so bump it and give requests a generous
+    # timeout. Both are env-overridable.
     return AzureOpenAI(
         azure_endpoint=require_env("AZURE_OPENAI_ENDPOINT"),
         api_key=require_env("AZURE_OPENAI_API_KEY"),
         azure_deployment=require_env("AZURE_OPENAI_DEPLOYMENT"),
         api_version=require_env("API_VERSION"),
+        max_retries=_env_int("OPENAI_MAX_RETRIES", 8),
+        timeout=_env_float("OPENAI_TIMEOUT", 60.0),
     )
 
 def smoke_test_databricks(limit: int) -> None:
@@ -443,6 +478,107 @@ def build_prompt_payload(doc: DocumentRow, max_chars: int) -> dict:
     }
 
 
+# Locate each event_confidence value in the raw JSON. Group 1 is the value
+# only (not the surrounding quotes), so its char span maps to the value tokens.
+_EVENT_CONFIDENCE_VALUE_RE = re.compile(r'"event_confidence"\s*:\s*"(high|medium|low)"')
+
+
+def _event_identity_key(hazard, dates, locations) -> tuple:
+    """Mirror DocumentEventExtractions._keep_verified_unique_events so we can
+    match a post-validation event back to its object in the raw model JSON."""
+    return (
+        (hazard or "").strip().lower(),
+        tuple(s.strip().lower() for s in (dates or []) if s and s.strip()),
+        tuple(s.strip().lower() for s in (locations or []) if s and s.strip()),
+    )
+
+
+def event_confidence_logprobs(completion, extraction: DocumentEventExtractions) -> list[Optional[dict]]:
+    """Token-level probability of each surviving event's event_confidence value.
+
+    Returns a list aligned to ``extraction.events``; each entry is
+    ``{"value": str, "logprob": float, "prob": float}`` or ``None`` when the
+    value could not be located (e.g. logprobs unavailable on a reasoning model,
+    or the raw JSON could not be matched).
+
+    The model's validator drops low-confidence / duplicate / under-specified
+    events, so surviving events do NOT line up positionally with the raw token
+    stream. We therefore reconstruct the response text from the token stream
+    (recording each token's char span), pair every raw event with the logprob
+    of its own confidence value, then match each surviving event to a raw event
+    by identity key.
+    """
+    n = len(extraction.events)
+    try:
+        choice = completion.choices[0]
+        lp = getattr(choice, "logprobs", None)
+        content = getattr(lp, "content", None) if lp else None
+        if not content:
+            return [None] * n
+
+        # Reconstruct text with per-token (start, end, logprob) char spans.
+        spans: list[tuple[int, int, float]] = []
+        parts: list[str] = []
+        cursor = 0
+        for tok in content:
+            s = tok.token
+            spans.append((cursor, cursor + len(s), tok.logprob))
+            parts.append(s)
+            cursor += len(s)
+        full = "".join(parts)
+
+        # Logprob for each confidence value occurrence, in raw JSON order.
+        value_lps: list[dict] = []
+        for m in _EVENT_CONFIDENCE_VALUE_RE.finditer(full):
+            v_start, v_end = m.span(1)
+            total = 0.0
+            found = False
+            for (s, e, token_lp) in spans:
+                if e <= v_start or s >= v_end:
+                    continue
+                total += token_lp
+                found = True
+            if found:
+                value_lps.append({"value": m.group(1), "logprob": total, "prob": math.exp(total)})
+
+        raw_events = (json.loads(full) or {}).get("events", []) or []
+
+        # Pair each raw event that carries a matchable confidence value with the
+        # next value logprob (same left-to-right order as the regex scan).
+        raw_pairs: list[tuple[tuple, dict]] = []  # (identity_key, logprob_dict)
+        vi = 0
+        for ev in raw_events:
+            conf = ev.get("event_confidence")
+            if conf not in ("high", "medium", "low"):
+                continue  # null/other → no regex match was produced for it
+            if vi >= len(value_lps):
+                break
+            key = _event_identity_key(
+                ev.get("event_hazard"), ev.get("event_dates"), ev.get("affected_locations")
+            )
+            raw_pairs.append((key, value_lps[vi]))
+            vi += 1
+
+        # Attach to each surviving event by identity, consuming matches once.
+        results: list[Optional[dict]] = []
+        used = [False] * len(raw_pairs)
+        for event in extraction.events:
+            key = _event_identity_key(
+                event.event_hazard, event.event_dates, event.affected_locations
+            )
+            match = None
+            for i, (raw_key, lp_dict) in enumerate(raw_pairs):
+                if not used[i] and raw_key == key:
+                    used[i] = True
+                    match = lp_dict
+                    break
+            results.append(match)
+        return results
+    except Exception:  # never let confidence scoring break extraction
+        logging.warning("event_confidence logprob mapping failed", exc_info=True)
+        return [None] * n
+
+
 def extract_document_with_openai(
     client: AzureOpenAI,
     doc: DocumentRow,
@@ -450,7 +586,7 @@ def extract_document_with_openai(
     model: str,
     reasoning_effort: Optional[str],
     prompt: PromptSpec,
-) -> DocumentEventExtractions:
+) -> tuple[DocumentEventExtractions, list[Optional[dict]]]:
     payload = build_prompt_payload(doc, max_chars=max_chars)
     completion_kwargs = {
         "model": model,
@@ -461,10 +597,16 @@ def extract_document_with_openai(
         "response_format": DocumentEventExtractions,
     }
     if reasoning_effort:
+        # Reasoning models do not return token logprobs; request them only for
+        # standard models so confidence scoring degrades gracefully to None.
         completion_kwargs["reasoning_effort"] = reasoning_effort
+    else:
+        completion_kwargs["logprobs"] = True
 
     completion = client.beta.chat.completions.parse(**completion_kwargs)
-    return completion.choices[0].message.parsed
+    extraction = completion.choices[0].message.parsed
+    conf_logprobs = event_confidence_logprobs(completion, extraction)
+    return extraction, conf_logprobs
 
 
 def save_jsonl(rows: List[dict], path: Path) -> None:
@@ -496,7 +638,11 @@ def _base_output_row(doc: DocumentRow) -> dict:
     }
 
 
-def extraction_to_output_rows(doc: DocumentRow, extraction: DocumentEventExtractions) -> list[dict]:
+def extraction_to_output_rows(
+    doc: DocumentRow,
+    extraction: DocumentEventExtractions,
+    conf_logprobs: Optional[list[Optional[dict]]] = None,
+) -> list[dict]:
     event_count = len(extraction.events)
     if event_count == 0:
         return [{
@@ -511,12 +657,17 @@ def extraction_to_output_rows(doc: DocumentRow, extraction: DocumentEventExtract
             "location_admin_levels": "",
             "key_impacts": "",
             "event_confidence": None,
+            "event_confidence_logprob": None,
+            "event_confidence_prob": None,
             "evidence_snippets": "",
             "missing_information": "no verified reliable event extracted",
         }]
 
+    if not conf_logprobs or len(conf_logprobs) != event_count:
+        conf_logprobs = [None] * event_count
+
     rows: list[dict] = []
-    for idx, event in enumerate(extraction.events, start=1):
+    for idx, (event, conf_lp) in enumerate(zip(extraction.events, conf_logprobs), start=1):
         rows.append({
             **_base_output_row(doc),
             "event_index": idx,
@@ -529,6 +680,8 @@ def extraction_to_output_rows(doc: DocumentRow, extraction: DocumentEventExtract
             "location_admin_levels": " | ".join(event.location_admin_levels),
             "key_impacts": " | ".join(event.key_impacts),
             "event_confidence": event.event_confidence,
+            "event_confidence_logprob": (conf_lp or {}).get("logprob"),
+            "event_confidence_prob": (conf_lp or {}).get("prob"),
             "evidence_snippets": " | ".join(event.evidence_snippets),
             "missing_information": " | ".join(event.missing_information),
         })
@@ -548,6 +701,8 @@ def error_output_rows(doc: DocumentRow, exc: Exception) -> list[dict]:
         "location_admin_levels": "",
         "key_impacts": f"ERROR: {exc}",
         "event_confidence": None,
+        "event_confidence_logprob": None,
+        "event_confidence_prob": None,
         "evidence_snippets": "",
         "missing_information": "",
     }]
@@ -620,13 +775,25 @@ def process_documents(
         resume,
     )
 
+    # An asset counts as "done" only if it has rows and none of them are error
+    # rows. Assets whose previous attempt errored (e.g. a 429) are re-queued so
+    # resume actually retries them instead of treating them as complete.
+    def asset_succeeded(asset_key: str) -> bool:
+        rows = completed_by_asset.get(asset_key)
+        return bool(rows) and not any(is_error_row(row) for row in rows)
+
     pending_documents = [
         doc for doc in documents
-        if doc.asset_key not in completed_by_asset
+        if not asset_succeeded(doc.asset_key)
     ]
+    retry_count = sum(
+        1 for doc in pending_documents if doc.asset_key in completed_by_asset
+    )
     skipped_count = len(documents) - len(pending_documents)
     if skipped_count:
         logging.info("Skipping %s already completed documents for prompt %02d", skipped_count, prompt.id)
+    if retry_count:
+        logging.info("Retrying %s previously failed documents for prompt %02d", retry_count, prompt.id)
 
     def get_thread_client() -> AzureOpenAI:
         if workers == 1 and client is not None:
@@ -640,7 +807,7 @@ def process_documents(
     def process_one(doc: DocumentRow) -> tuple[list[dict], float, bool]:
         doc_started_at = time.perf_counter()
         try:
-            extraction = extract_document_with_openai(
+            extraction, conf_logprobs = extract_document_with_openai(
                 client=get_thread_client(),
                 doc=doc,
                 max_chars=max_chars,
@@ -648,7 +815,7 @@ def process_documents(
                 reasoning_effort=reasoning_effort,
                 prompt=prompt,
             )
-            rows = extraction_to_output_rows(doc, extraction)
+            rows = extraction_to_output_rows(doc, extraction, conf_logprobs)
             failed = False
         except Exception as exc:
             logging.exception("OpenAI extraction failed for asset_key=%s: %s", doc.asset_key, exc)
@@ -705,6 +872,11 @@ def process_documents(
 
     save_jsonl(output_rows, output_dir / "event_extractions.jsonl")
     save_csv(output_rows, output_dir / "event_extractions.csv")
+
+    # Compact the append-only progress log to the final deduped state so the
+    # next resume sees one clean record per asset (retried successes no longer
+    # carry their stale error rows from earlier attempts).
+    save_jsonl(output_rows, progress_path)
 
     elapsed = time.perf_counter() - started_at
     docs_per_min = (new_completed / elapsed * 60.0) if elapsed > 0 else 0.0
@@ -871,47 +1043,64 @@ def main() -> None:
         list_prompts()
         return
 
-    if args.db_only:
-        smoke_test_databricks(limit=args.limit)
-        return
+    run_started_at = time.perf_counter()
+    status = "ok"
+    try:
+        if args.db_only:
+            smoke_test_databricks(limit=args.limit)
+            return
 
-    documents = fetch_documents(limit=args.limit)
-    client = get_azure_openai_client() if args.workers == 1 else None
+        documents = fetch_documents(limit=args.limit)
+        client = get_azure_openai_client() if args.workers == 1 else None
 
-    if args.all:
-        for prompt in PROMPTS:
-            output_dir = all_mode_output_dir(
-                output_root=args.output_root,
-                limit=args.limit,
-                model=args.model,
-                reasoning_effort=args.reasoning_effort,
-                prompt=prompt,
-            )
-            process_documents(
-                documents=documents,
-                max_chars=args.max_chars,
-                output_dir=output_dir,
-                model=args.model,
-                reasoning_effort=args.reasoning_effort,
-                prompt=prompt,
-                client=client,
-                workers=args.workers,
-                resume=args.resume,
-            )
-        return
+        if args.all:
+            for prompt in PROMPTS:
+                output_dir = all_mode_output_dir(
+                    output_root=args.output_root,
+                    limit=args.limit,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                    prompt=prompt,
+                )
+                process_documents(
+                    documents=documents,
+                    max_chars=args.max_chars,
+                    output_dir=output_dir,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                    prompt=prompt,
+                    client=client,
+                    workers=args.workers,
+                    resume=args.resume,
+                )
+            return
 
-    prompt = get_prompt(args.prompt)
-    process_documents(
-        documents=documents,
-        max_chars=args.max_chars,
-        output_dir=args.output_dir,
-        model=args.model,
-        reasoning_effort=args.reasoning_effort,
-        prompt=prompt,
-        client=client,
-        workers=args.workers,
-        resume=args.resume,
-    )
+        prompt = get_prompt(args.prompt)
+        process_documents(
+            documents=documents,
+            max_chars=args.max_chars,
+            output_dir=args.output_dir,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            prompt=prompt,
+            client=client,
+            workers=args.workers,
+            resume=args.resume,
+        )
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        total_elapsed = time.perf_counter() - run_started_at
+        logging.info(
+            "Total run time: %s (%.1fs) | status=%s",
+            format_duration(total_elapsed),
+            total_elapsed,
+            status,
+        )
 
 
 if __name__ == "__main__":
