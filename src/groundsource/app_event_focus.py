@@ -285,6 +285,16 @@ def require_env(name: str) -> str:
 
 def connect_databricks():
     ca_file = os.getenv("DATABRICKS_CA_FILE", certifi.where())
+    if not os.path.isfile(ca_file):
+        raise ValueError(
+            f"DATABRICKS_CA_FILE={ca_file!r} is not a file. If you're running "
+            "via Docker Compose, this usually means the host-side "
+            "./databricks_chain.pem bind-mount source didn't exist when the "
+            "container started, so Docker created an empty directory there "
+            "instead. Either place the real CA chain at that path, or unset "
+            "DATABRICKS_CA_FILE (and its volume mount) to fall back to "
+            "certifi's default trust store."
+        )
     return sql.connect(
         server_hostname=require_env("DATABRICKS_SERVER_HOSTNAME"),
         http_path=require_env("DATABRICKS_HTTP_PATH"),

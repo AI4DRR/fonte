@@ -4,9 +4,6 @@ services:
     image: undrr-groundsource:latest
     container_name: undrr-extractor
     env_file: .env
-    environment:
-      # Point the app at the Databricks cert mounted below.
-      DATABRICKS_CA_FILE: /app/databricks_chain.pem
     volumes:
       # Persist outputs to the VM's working directory so results survive
       # container rebuilds.
@@ -14,8 +11,6 @@ services:
       # The Nominatim geocode cache is large and slow to rebuild; keep it
       # on the host so reruns stay fast.
       - ./.nominatim_cache.json:/app/.nominatim_cache.json
-      # Databricks TLS chain (gitignored, scp'd to the VM separately).
-      - ./databricks_chain.pem:/app/databricks_chain.pem:ro
     # Default command is the extraction pipeline. Run polygon resolution
     # with: `docker compose run --rm extractor groundsource-polygons ...`
     command: ["groundsource-extract", "--limit", "5"]
