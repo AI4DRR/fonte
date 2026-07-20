@@ -47,6 +47,14 @@ groundsource-extract --db-only --limit 3
 # Run a small extraction.
 groundsource-extract --limit 5 --output-dir outputs/event_extractions
 
+# Long runs: checkpoint + stop + resume. The extractor refreshes
+# event_extractions.jsonl/.csv and checkpoint_status.json every
+# --checkpoint-every documents (default 5000), so results are checkable
+# mid-run. Ctrl-C (or SIGTERM / docker stop) shuts down gracefully and
+# writes a final checkpoint; rerun with --resume to pick up where it left off.
+groundsource-extract --limit 100000 --workers 4 --resume \
+  --checkpoint-every 5000 --output-dir outputs/full_run
+
 # Resolve polygons from an extraction JSONL.
 groundsource-polygons \
   --input outputs/event_extractions/event_extractions.jsonl \

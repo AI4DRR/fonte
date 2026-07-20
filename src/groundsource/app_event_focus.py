@@ -5,10 +5,12 @@ import logging
 import math
 import os
 import re
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -620,18 +622,24 @@ def extract_document_with_openai(
 
 
 def save_jsonl(rows: List[dict], path: Path) -> None:
+    # Write-then-rename so readers (and a resume after a hard kill) never see
+    # a half-written file.
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, path)
 
 
 def save_csv(rows: List[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_HEADERS)
         writer.writeheader()
         writer.writerows(rows)
+    os.replace(tmp_path, path)
 
 
 def _base_output_row(doc: DocumentRow) -> dict:
@@ -755,6 +763,53 @@ def append_progress_rows(rows: list[dict], path: Path, lock: threading.Lock) -> 
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_checkpoint(
+    documents: List[DocumentRow],
+    completed_by_asset: dict[str, list[dict]],
+    output_dir: Path,
+    *,
+    documents_done: int,
+    documents_remaining: int,
+    failures_this_run: int,
+    docs_per_min: float,
+) -> list[dict]:
+    """Refresh the consolidated output files from everything completed so far.
+
+    Called every --checkpoint-every documents and again at the end of the run,
+    so event_extractions.jsonl/.csv are always usable mid-run and
+    checkpoint_status.json summarises where the run stands.
+    """
+    output_rows: list[dict] = []
+    for doc in documents:
+        output_rows.extend(completed_by_asset.get(doc.asset_key, []))
+
+    save_jsonl(output_rows, output_dir / "event_extractions.jsonl")
+    save_csv(output_rows, output_dir / "event_extractions.csv")
+
+    error_rows = sum(1 for row in output_rows if is_error_row(row))
+    eta_seconds = (
+        documents_remaining / docs_per_min * 60.0 if docs_per_min > 0 else None
+    )
+    status = {
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "documents_total": len(documents),
+        "documents_done": documents_done,
+        "documents_remaining": documents_remaining,
+        "failures_this_run": failures_this_run,
+        "output_rows": len(output_rows),
+        "error_rows": error_rows,
+        "docs_per_min_this_run": round(docs_per_min, 2),
+        "estimated_time_remaining": (
+            format_duration(eta_seconds) if eta_seconds is not None else None
+        ),
+    }
+    status_path = output_dir / "checkpoint_status.json"
+    tmp_path = status_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, status_path)
+    return output_rows
+
+
 def process_documents(
     documents: List[DocumentRow],
     max_chars: int,
@@ -765,6 +820,7 @@ def process_documents(
     client: Optional[AzureOpenAI],
     workers: int = 1,
     resume: bool = False,
+    checkpoint_every: int = 5000,
 ) -> None:
     started_at = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -837,6 +893,19 @@ def process_documents(
     new_failures = 0
     total_pending = len(pending_documents)
 
+    def run_checkpoint() -> list[dict]:
+        elapsed_so_far = time.perf_counter() - started_at
+        rate = (new_completed / elapsed_so_far * 60.0) if elapsed_so_far > 0 else 0.0
+        return write_checkpoint(
+            documents,
+            completed_by_asset,
+            output_dir,
+            documents_done=skipped_count + new_completed,
+            documents_remaining=total_pending - new_completed,
+            failures_this_run=new_failures,
+            docs_per_min=rate,
+        )
+
     def record_completed(rows: list[dict], elapsed: float, failed: bool) -> None:
         nonlocal new_completed, new_failures
         asset_key = rows[0]["asset_key"] if rows else ""
@@ -854,9 +923,21 @@ def process_documents(
             asset_key,
             "error" if failed else "ok",
         )
+        if checkpoint_every and new_completed % checkpoint_every == 0:
+            run_checkpoint()
+            logging.info(
+                "Checkpoint: %s/%s documents done, %s remaining — refreshed "
+                "event_extractions.jsonl/.csv and checkpoint_status.json in %s",
+                skipped_count + new_completed,
+                len(documents),
+                total_pending - new_completed,
+                output_dir,
+            )
 
+    interrupted = False
     if total_pending and workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             future_to_doc = {
                 executor.submit(process_one, doc): doc
                 for doc in pending_documents
@@ -871,17 +952,26 @@ def process_documents(
                     elapsed = 0.0
                     failed = True
                 record_completed(rows, elapsed, failed)
+        except KeyboardInterrupt:
+            interrupted = True
+            logging.warning(
+                "Stop requested — cancelling queued documents and waiting for "
+                "up to %s in-flight extraction(s) to finish...",
+                workers,
+            )
+            executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
     else:
-        for doc in pending_documents:
-            rows, elapsed, failed = process_one(doc)
-            record_completed(rows, elapsed, failed)
+        try:
+            for doc in pending_documents:
+                rows, elapsed, failed = process_one(doc)
+                record_completed(rows, elapsed, failed)
+        except KeyboardInterrupt:
+            interrupted = True
+            logging.warning("Stop requested — writing final checkpoint before exit.")
 
-    output_rows = []
-    for doc in documents:
-        output_rows.extend(completed_by_asset.get(doc.asset_key, []))
-
-    save_jsonl(output_rows, output_dir / "event_extractions.jsonl")
-    save_csv(output_rows, output_dir / "event_extractions.csv")
+    output_rows = run_checkpoint()
 
     # Compact the append-only progress log to the final deduped state so the
     # next resume sees one clean record per asset (retried successes no longer
@@ -905,6 +995,14 @@ def process_documents(
     logging.info("  - %s", output_dir / "event_extractions_progress.jsonl")
     logging.info("  - %s", output_dir / "event_extractions.jsonl")
     logging.info("  - %s", output_dir / "event_extractions.csv")
+    logging.info("  - %s", output_dir / "checkpoint_status.json")
+    if interrupted:
+        logging.warning(
+            "Run stopped early — %s document(s) still pending. Rerun with the "
+            "same --output-dir plus --resume to pick up where it left off.",
+            total_pending - new_completed,
+        )
+        raise KeyboardInterrupt
 
 
 def slugify_model(model: str) -> str:
@@ -1003,6 +1101,18 @@ def parse_args() -> argparse.Namespace:
         help="Resume from existing event_extractions_progress.jsonl or event_extractions.jsonl.",
     )
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=5000,
+        help=(
+            "Refresh event_extractions.jsonl/.csv and checkpoint_status.json "
+            "after this many completed documents so results are checkable "
+            "mid-run. 0 disables mid-run checkpoints (files are still written "
+            "at the end). For very large runs a bigger interval reduces "
+            "rewrite overhead."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         type=int,
         default=DEFAULT_PROMPT_ID,
@@ -1035,6 +1145,9 @@ def parse_args() -> argparse.Namespace:
     if args.workers < 1:
         parser.error("--workers must be >= 1")
 
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be >= 0")
+
     if not args.all and not args.list_prompts and not args.db_only:
         try:
             get_prompt(args.prompt)
@@ -1044,9 +1157,17 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _sigterm_to_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     load_dotenv()
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+    # Treat SIGTERM (docker stop, systemctl stop) like Ctrl-C so the run shuts
+    # down gracefully: queued documents are cancelled, a final checkpoint is
+    # written, and --resume picks up cleanly next time.
+    signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
     args = parse_args()
 
     if args.list_prompts:
@@ -1082,6 +1203,7 @@ def main() -> None:
                     client=client,
                     workers=args.workers,
                     resume=args.resume,
+                    checkpoint_every=args.checkpoint_every,
                 )
             return
 
@@ -1096,6 +1218,7 @@ def main() -> None:
             client=client,
             workers=args.workers,
             resume=args.resume,
+            checkpoint_every=args.checkpoint_every,
         )
     except KeyboardInterrupt:
         status = "interrupted"

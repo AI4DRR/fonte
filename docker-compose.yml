@@ -14,6 +14,9 @@ services:
     # Default command is the extraction pipeline. Run polygon resolution
     # with: `docker compose run --rm extractor groundsource-polygons ...`
     command: ["groundsource-extract", "--limit", "5"]
+    # On stop, the extractor cancels queued work, waits for in-flight API
+    # calls, and writes a final checkpoint — give it time before SIGKILL.
+    stop_grace_period: 10m
 
   review:
     # Streamlit gold-review UI. Start with `docker compose up review`.
