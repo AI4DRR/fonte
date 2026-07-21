@@ -13,7 +13,15 @@ services:
       - ./.nominatim_cache.json:/app/.nominatim_cache.json
     # Default command is the extraction pipeline. Run polygon resolution
     # with: `docker compose run --rm extractor groundsource-polygons ...`
-    command: ["groundsource-extract", "--limit", "5"]
+    command:
+      - groundsource-extract
+      - --limit
+      - "10000"
+      - --resume
+      - --checkpoint-every
+      - "5000"
+      - --output-dir
+      - outputs/event_extractions
     # On stop, the extractor cancels queued work, waits for in-flight API
     # calls, and writes a final checkpoint — give it time before SIGKILL.
     stop_grace_period: 10m
