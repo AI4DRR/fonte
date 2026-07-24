@@ -1,5 +1,5 @@
 .PHONY: setup test extract db-check polygons review docker-build prefill recommend polygon-score \
-	gold-extract gold-polygons gold-prefill-validation gold-validate gold-validation-score
+	gold-extract gold-polygons gold-prefill-validation gold-validate gold-validation-score upload
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -17,6 +17,7 @@ test:
 db-check:
 	$(VENV_BIN)/groundsource-extract --db-only --limit 3
 
+# Writes to $EXTRACT_OUTPUT_DIR (see .env).
 extract:
 	$(VENV_BIN)/groundsource-extract --limit 5
 
@@ -85,3 +86,7 @@ gold-validation-score:
 
 docker-build:
 	docker build -t undrr-groundsource .
+
+# Upload local $EXTRACT_OUTPUT_DIR files to Azure Blob Storage (independent of extract/polygons).
+upload:
+	$(VENV_BIN)/groundsource-upload

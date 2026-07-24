@@ -966,8 +966,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/event_extractions"),
-        help="Folder where JSONL and CSV outputs will be saved.",
+        default=None,
+        help=(
+            "Folder where JSONL and CSV outputs will be saved. "
+            "Defaults to $EXTRACT_OUTPUT_DIR when not given."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -1085,11 +1088,15 @@ def main() -> None:
                 )
             return
 
+        output_dir = args.output_dir
+        if output_dir is None:
+            output_dir = Path(require_env("EXTRACT_OUTPUT_DIR"))
+
         prompt = get_prompt(args.prompt)
         process_documents(
             documents=documents,
             max_chars=args.max_chars,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
             prompt=prompt,

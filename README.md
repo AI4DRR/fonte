@@ -13,12 +13,14 @@ eval/               prompt-evaluation runbook, gold labels, and scoring tools
 tests/              lightweight local tests
 data/               small reference geodata used by polygon post-processing
 outputs/            generated runs and maps; gitignored
+extract/            default $EXTRACT_OUTPUT_DIR destination for groundsource-extract; gitignored
 ```
 
 The main entry points are installed as console commands:
 
 - `groundsource-extract` runs the Databricks to Azure OpenAI extraction pipeline.
 - `groundsource-polygons` resolves extracted locations to geometries.
+- `groundsource-upload` uploads extraction outputs to Azure Blob Storage.
 
 ## Setup
 
@@ -60,6 +62,26 @@ streamlit run eval/gold_review_app.py
 
 You can also use `make setup`, `make extract`, `make polygons`, and
 `make review` for the same workflows.
+
+## Demo Extraction And Upload
+
+`make extract` (no explicit `--output-dir`) and `groundsource-upload`
+(no explicit `--source`) both default to the local folder configured by
+`EXTRACT_OUTPUT_DIR` in `.env` (e.g. `extract/demo`):
+
+```bash
+# Extract into $EXTRACT_OUTPUT_DIR.
+make extract
+
+# Upload every file under $EXTRACT_OUTPUT_DIR to Azure Blob Storage at
+# STORAGEACCOUNT_OUTPUT_CONTAINER/STORAGEACCOUNT_OUTPUT_PREFIX/.
+make upload
+```
+
+Requires `STORAGEACCOUNT_ENDPOINT`, `STORAGEACCOUNT_TOKEN`,
+`STORAGEACCOUNT_OUTPUT_CONTAINER`, and `STORAGEACCOUNT_OUTPUT_PREFIX` in
+`.env` (see `.env.example`). Existing blobs with the same name are
+overwritten, and the upload prints a signed validation URL for each file.
 
 ## Docker
 
