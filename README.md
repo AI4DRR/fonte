@@ -56,12 +56,16 @@ groundsource-polygons \
   --coastline data/ne_50m_coastline.zip \
   --user-agent "undrr-groundsource/0.1 (you@example.org)"
 
+# Build an interactive map from the resolved polygons.
+# Writes outputs/event_extractions/polygon_map.html.
+make visualisation
+
 # Open the gold-review UI.
 streamlit run eval/gold_review_app.py
 ```
 
-You can also use `make setup`, `make extract`, `make polygons`, and
-`make review` for the same workflows.
+You can also use `make setup`, `make extract`, `make polygons`,
+`make visualisation`, and `make review` for the same workflows.
 
 ## Demo Extraction And Upload
 

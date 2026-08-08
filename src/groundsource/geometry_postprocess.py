@@ -64,7 +64,9 @@ from typing import Optional, Tuple
 
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
+from shapely.errors import GEOSException
 from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 
 LOG = logging.getLogger(__name__)
@@ -185,7 +187,30 @@ class CoastalBuffer:
         if geom is None or geom.is_empty:
             return None
         coast = self._load_or_build()
-        clipped = geom.intersection(coast)
+
+        if not geom.is_valid:
+            LOG.warning("Geometry invalid before coastal clip; attempting repair.")
+            geom = make_valid(geom)
+            if geom is None or geom.is_empty:
+                LOG.warning("Geometry repair produced empty geometry; skipping coastal clip.")
+                return None
+
+        try:
+            clipped = geom.intersection(coast)
+        except GEOSException as exc:
+            LOG.warning("Coastal clip failed with invalid topology: %s; returning original geometry.", exc)
+            return geom
+        except Exception as exc:
+            LOG.warning("Coastal clip failed with %s; attempting repair and retry.", exc)
+            geom = make_valid(geom)
+            if geom is None or geom.is_empty:
+                return None
+            try:
+                clipped = geom.intersection(coast)
+            except GEOSException as exc2:
+                LOG.warning("Coastal clip retry failed with invalid topology: %s; returning original geometry.", exc2)
+                return geom
+
         if clipped.is_empty:
             return None
         # Normalise to (Multi)Polygon — intersections sometimes drop to lines
