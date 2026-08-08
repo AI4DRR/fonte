@@ -8,6 +8,8 @@ services:
       # Persist outputs to the VM's working directory so results survive
       # container rebuilds.
       - ./outputs:/app/outputs
+      # $EXTRACT_OUTPUT_DIR (see .env) defaults to extract/demo.
+      - ./extract:/app/extract
       # The Nominatim geocode cache is large and slow to rebuild; keep it
       # on the host so reruns stay fast.
       - ./.nominatim_cache.json:/app/.nominatim_cache.json

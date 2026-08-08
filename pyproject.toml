@@ -35,6 +35,7 @@ dev = [
 [project.scripts]
 groundsource-extract = "groundsource.app_event_focus:main"
 groundsource-polygons = "groundsource.run_polygon_resolution:main"
+groundsource-upload = "groundsource.upload_outputs:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

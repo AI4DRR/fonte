@@ -9,6 +9,7 @@ __pycache__
 *.pem
 .DS_Store
 outputs/
+extract/
 .nominatim_cache.json
 dbx-debug.log
 map.html

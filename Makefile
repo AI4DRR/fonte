@@ -1,10 +1,17 @@
-.PHONY: setup test extract db-check polygons review docker-build prefill recommend polygon-score \
-	gold-extract gold-polygons gold-prefill-validation gold-validate gold-validation-score
+.PHONY: setup test extract db-check polygons visualisation visualization review docker-build prefill recommend polygon-score \
+	gold-extract gold-polygons gold-prefill-validation gold-validate gold-validation-score upload
 
 PYTHON ?= python3
 VENV ?= .venv
 VENV_BIN := $(VENV)/bin
 VENV_PYTHON := $(VENV_BIN)/python
+
+# Default output directory for extraction (can be overridden from environment)
+EXTRACT_OUTPUT_DIR=outputs/event_extractions
+
+# Default Nominatim user agent required by the Nominatim API policy.
+# Customize this with a real contact if you prefer.
+NOMINATIM_USER_AGENT ?= undrr-groundsource/0.1 (camilla.andreozzi@un.org)
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -17,15 +24,29 @@ test:
 db-check:
 	$(VENV_BIN)/groundsource-extract --db-only --limit 3
 
+# Writes to $EXTRACT_OUTPUT_DIR (see .env).
 extract:
-	$(VENV_BIN)/groundsource-extract --limit 5
+	$(VENV_BIN)/groundsource-extract \
+		--limit 10000 \
+		--resume \
+		--output-dir $(EXTRACT_OUTPUT_DIR)
 
 polygons:
 	$(VENV_BIN)/groundsource-polygons \
-		--input outputs/event_extractions/event_extractions.jsonl \
-		--output outputs/event_extractions/event_geometries.parquet \
+		--input $(EXTRACT_OUTPUT_DIR)/event_extractions.jsonl \
+		--output $(EXTRACT_OUTPUT_DIR)/event_geometries.parquet \
 		--coastline data/ne_50m_coastline.zip \
-		--user-agent "$$NOMINATIM_USER_AGENT"
+		--user-agent "$(NOMINATIM_USER_AGENT)"
+
+visualisation:
+	$(VENV_PYTHON) scripts/visualize_event_extractions.py \
+		--map-only \
+		--output-dir $(EXTRACT_OUTPUT_DIR)/visualisation_checks \
+		--geometries $(EXTRACT_OUTPUT_DIR)/event_geometries.parquet \
+		--map-output $(EXTRACT_OUTPUT_DIR)/polygon_map.html \
+		--require-geometries
+
+visualization: visualisation
 
 review:
 	$(VENV_PYTHON) -m streamlit run eval/gold_review_app.py
@@ -85,3 +106,7 @@ gold-validation-score:
 
 docker-build:
 	docker build -t undrr-groundsource .
+
+# Upload local $EXTRACT_OUTPUT_DIR files to Azure Blob Storage (independent of extract/polygons).
+upload:
+	$(VENV_BIN)/groundsource-upload --source $(EXTRACT_OUTPUT_DIR)
