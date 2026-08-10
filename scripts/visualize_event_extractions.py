@@ -1,10 +1,11 @@
 import argparse
+import html
 import json
 import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 os.environ.setdefault(
     "MPLCONFIGDIR",
@@ -40,6 +41,7 @@ MAP_TOOLTIP_FIELDS = [
     "location_text",
     "resolution_confidence",
 ]
+HAZARD_UNSPECIFIED_LABEL = "(no hazard)"
 CARTO_LIGHT_TILES = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
 CARTO_ATTRIBUTION = (
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
@@ -331,7 +333,55 @@ def build_map_summary(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     )
 
 
-def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
+def hazard_options(gdf: gpd.GeoDataFrame) -> List[Tuple[str, int]]:
+    """Distinct hazard kinds on the map, most frequent first.
+
+    `hazard` holds pipe-separated kinds for multi-hazard events, so a row can
+    contribute to several options. Rows without a hazard get their own bucket
+    so they stay toggleable instead of silently vanishing.
+    """
+    if "hazard" not in gdf.columns:
+        return []
+
+    counts: dict = {}
+    for value in gdf["hazard"]:
+        kinds = split_pipe_values(value) or [HAZARD_UNSPECIFIED_LABEL]
+        for kind in dict.fromkeys(kinds):
+            counts[kind] = counts.get(kind, 0) + 1
+
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+
+
+def hazard_control_html(hazards: List[Tuple[str, int]]) -> str:
+    if not hazards:
+        return ""
+
+    checkboxes = "\n".join(
+        '        <label class="hazard-option">'
+        f'<input type="checkbox" class="hazard-checkbox" value="{html.escape(kind, quote=True)}" checked>'
+        f'<span>{html.escape(kind)}</span>'
+        f'<span class="hazard-count">{count:,}</span>'
+        "</label>"
+        for kind, count in hazards
+    )
+    return f"""
+      <div class="filter-divider"></div>
+      <label>Hazard kind</label>
+      <div class="hazard-actions">
+        <button type="button" id="hazard-select-all">All</button>
+        <button type="button" id="hazard-select-none">None</button>
+      </div>
+      <div id="hazard-list">
+{checkboxes}
+      </div>
+"""
+
+
+def add_map_filters(
+    fmap: folium.Map,
+    geojson_name: str,
+    hazards: List[Tuple[str, int]],
+) -> None:
     control_html = """
     <div id="confidence-filter" class="leaflet-bar">
       <label>Confidence range</label>
@@ -345,6 +395,7 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
         <input id="confidence-min-slider" type="range" min="0" max="1" step="0.01" value="0">
         <input id="confidence-max-slider" type="range" min="0" max="1" step="0.01" value="1">
       </div>
+      __HAZARD_CONTROL__
       <div id="confidence-count"></div>
     </div>
     <style>
@@ -354,6 +405,8 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
         right: 12px;
         z-index: 9999;
         width: 240px;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
         padding: 10px 12px;
         background: rgba(255, 255, 255, 0.94);
         border: 1px solid #9d9d9d;
@@ -366,6 +419,52 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
         display: block;
         margin-bottom: 6px;
         font-weight: 700;
+      }
+      #confidence-filter .filter-divider {
+        margin: 10px 0 8px;
+        border-top: 1px solid #d8d8d8;
+      }
+      #confidence-filter .hazard-actions {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+      #confidence-filter .hazard-actions button {
+        flex: 1;
+        padding: 3px 0;
+        border: 1px solid #9d9d9d;
+        border-radius: 3px;
+        background: #f4f4f4;
+        color: #222;
+        font: inherit;
+        cursor: pointer;
+      }
+      #confidence-filter .hazard-actions button:hover {
+        background: #e6e6e6;
+      }
+      #hazard-list {
+        max-height: 220px;
+        overflow-y: auto;
+        padding-right: 2px;
+      }
+      #confidence-filter .hazard-option {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        margin-bottom: 2px;
+        font-weight: 400;
+        cursor: pointer;
+      }
+      #confidence-filter .hazard-option input {
+        margin: 2px 0 0;
+        flex: none;
+      }
+      #confidence-filter .hazard-option span:first-of-type {
+        flex: 1;
+      }
+      #confidence-filter .hazard-count {
+        color: #777;
+        font-variant-numeric: tabular-nums;
       }
       #confidence-filter .confidence-values {
         display: flex;
@@ -441,6 +540,10 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
       var maxValue = document.getElementById("confidence-max-value");
       var fill = document.getElementById("confidence-fill");
       var count = document.getElementById("confidence-count");
+      var hazardBoxes = Array.prototype.slice.call(
+        document.querySelectorAll(".hazard-checkbox")
+      );
+      var unspecifiedHazard = {json.dumps(HAZARD_UNSPECIFIED_LABEL)};
       var allLayers = [];
 
       if (!polygonLayer || !minSlider || !maxSlider || !minValue || !maxValue || !fill || !count) {{
@@ -459,9 +562,31 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
         return Number.isFinite(parsed) ? parsed : 0;
       }}
 
+      function hazardsFor(layer) {{
+        var raw = layer.feature && layer.feature.properties
+          ? layer.feature.properties.hazard
+          : null;
+        var kinds = String(raw == null ? "" : raw)
+          .split("|")
+          .map(function(part) {{ return part.trim(); }})
+          .filter(function(part) {{ return part.length > 0; }});
+        return kinds.length ? kinds : [unspecifiedHazard];
+      }}
+
+      function selectedHazards() {{
+        var selected = {{}};
+        hazardBoxes.forEach(function(box) {{
+          if (box.checked) {{
+            selected[box.value] = true;
+          }}
+        }});
+        return selected;
+      }}
+
       function applyFilter() {{
         var minConfidence = Number(minSlider.value);
         var maxConfidence = Number(maxSlider.value);
+        var hazardFilter = selectedHazards();
         var visible = 0;
 
         if (minConfidence > maxConfidence) {{
@@ -481,7 +606,12 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
 
         allLayers.forEach(function(layer) {{
           var confidence = confidenceFor(layer);
-          if (confidence >= minConfidence && confidence <= maxConfidence) {{
+          var inConfidence = confidence >= minConfidence && confidence <= maxConfidence;
+          var inHazard = !hazardBoxes.length || hazardsFor(layer).some(function(kind) {{
+            return hazardFilter[kind] === true;
+          }});
+
+          if (inConfidence && inHazard) {{
             if (!polygonLayer.hasLayer(layer)) {{
               polygonLayer.addLayer(layer);
             }}
@@ -495,12 +625,34 @@ def add_confidence_slider(fmap: folium.Map, geojson_name: str) -> None:
           + allLayers.length.toLocaleString() + " polygons";
       }}
 
+      function setAllHazards(checked) {{
+        hazardBoxes.forEach(function(box) {{
+          box.checked = checked;
+        }});
+        applyFilter();
+      }}
+
       minSlider.addEventListener("input", applyFilter);
       maxSlider.addEventListener("input", applyFilter);
+      hazardBoxes.forEach(function(box) {{
+        box.addEventListener("change", applyFilter);
+      }});
+
+      var selectAll = document.getElementById("hazard-select-all");
+      var selectNone = document.getElementById("hazard-select-none");
+      if (selectAll) {{
+        selectAll.addEventListener("click", function() {{ setAllHazards(true); }});
+      }}
+      if (selectNone) {{
+        selectNone.addEventListener("click", function() {{ setAllHazards(false); }});
+      }}
+
       applyFilter();
     }});
     """
-    fmap.get_root().html.add_child(Element(control_html))
+    fmap.get_root().html.add_child(
+        Element(control_html.replace("__HAZARD_CONTROL__", hazard_control_html(hazards)))
+    )
     fmap.get_root().script.add_child(Element(script))
 
 
@@ -543,7 +695,7 @@ def save_polygon_map(gdf: gpd.GeoDataFrame, output_path: Path) -> None:
         else None,
     )
     geojson.add_to(fmap)
-    add_confidence_slider(fmap, geojson.get_name())
+    add_map_filters(fmap, geojson.get_name(), hazard_options(gdf))
 
     folium.LayerControl(collapsed=False).add_to(fmap)
     output_path.parent.mkdir(parents=True, exist_ok=True)
